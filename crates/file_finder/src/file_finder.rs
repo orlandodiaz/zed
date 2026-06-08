@@ -189,9 +189,8 @@ impl FileFinder {
         let file_finder_settings = FileFinderSettings::get_global(cx);
         let modal_max_width = Self::modal_max_width(file_finder_settings.modal_max_width, window);
 
-        let project = delegate.project.clone();
         let picker = cx.new(|cx| {
-            Picker::uniform_list_with_preview(delegate, project, window, cx)
+            Picker::uniform_list(delegate, window, cx)
                 .width(Rems::from_pixels(modal_max_width, window))
         });
         let picker_focus_handle = picker.focus_handle(cx);

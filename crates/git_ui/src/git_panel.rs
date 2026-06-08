@@ -5342,10 +5342,10 @@ impl GitPanel {
                     this.selected_entry = Some(ix);
                     cx.notify();
                     if event.click_count() > 1 || event.modifiers().secondary() {
-                        this.open_file(&Default::default(), window, cx)
-                    } else {
                         this.open_diff(&Default::default(), window, cx);
                         this.focus_handle.focus(window, cx);
+                    } else {
+                        this.open_file(&Default::default(), window, cx)
                     }
                 })
             })
