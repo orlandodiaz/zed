@@ -166,8 +166,24 @@ impl QuickSearch {
                 None
             };
             workspace.toggle_modal(window, cx, |window, cx| {
-                QuickSearch::new(weak_workspace, project, initial_query, window, cx)
+                QuickSearch::new(weak_workspace, project, initial_query, None, window, cx)
             });
+        });
+    }
+
+    /// Open the quick search popup pre-filtered to a directory (used by the
+    /// project panel's "Find in Folder…" action). Pre-fills the include filter
+    /// with `dir_path` and reveals the filter row.
+    pub fn deploy_in_directory(
+        workspace: &mut Workspace,
+        dir_path: String,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let project = workspace.project().clone();
+        let weak_workspace = cx.entity().downgrade();
+        workspace.toggle_modal(window, cx, |window, cx| {
+            QuickSearch::new(weak_workspace, project, None, Some(dir_path), window, cx)
         });
     }
 
@@ -175,6 +191,7 @@ impl QuickSearch {
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         initial_query: Option<String>,
+        included_path: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -260,6 +277,13 @@ impl QuickSearch {
                     TelescopeLayoutState::new(),
                 )
             };
+
+        if let Some(path) = included_path.filter(|path| !path.is_empty()) {
+            included_files_editor.set_text(&path, window, cx);
+            picker.update(cx, |picker, _cx| {
+                picker.delegate.filters_enabled = true;
+            });
+        }
 
         Self {
             picker,

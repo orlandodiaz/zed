@@ -3571,9 +3571,9 @@ impl ProjectPanel {
                         // File at root, open search with empty filter
                         self.workspace
                             .update(cx, |workspace, cx| {
-                                search::ProjectSearchView::new_search_in_directory(
+                                search::quick_search::QuickSearch::deploy_in_directory(
                                     workspace,
-                                    RelPath::empty(),
+                                    String::new(),
                                     window,
                                     cx,
                                 );
@@ -3593,8 +3593,9 @@ impl ProjectPanel {
 
             self.workspace
                 .update(cx, |workspace, cx| {
-                    search::ProjectSearchView::new_search_in_directory(
-                        workspace, &dir_path, window, cx,
+                    let filter_str = dir_path.display(workspace.path_style(cx)).to_string();
+                    search::quick_search::QuickSearch::deploy_in_directory(
+                        workspace, filter_str, window, cx,
                     );
                 })
                 .ok();
