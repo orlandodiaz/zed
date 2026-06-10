@@ -10138,6 +10138,35 @@ async fn run_create_file_in_folded_path_case(
     }
 }
 
+#[gpui::test]
+async fn test_folder_chevrons_setting(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    // Defaults to disabled.
+    let default_value = cx.update(|cx| ProjectPanelSettings::get_global(cx).folder_chevrons);
+    assert!(
+        !default_value,
+        "folder_chevrons should default to false"
+    );
+
+    // A user override is reflected in the resolved global setting.
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .project_panel
+                    .get_or_insert_default()
+                    .folder_chevrons = Some(true);
+            });
+        });
+    });
+    let overridden_value = cx.update(|cx| ProjectPanelSettings::get_global(cx).folder_chevrons);
+    assert!(
+        overridden_value,
+        "folder_chevrons should reflect the user override"
+    );
+}
+
 pub(crate) fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);
