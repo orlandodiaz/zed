@@ -719,6 +719,12 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: true
     pub folder_icons: Option<bool>,
+    /// Whether to show a disclosure chevron before the folder icon for
+    /// directories in the project panel (Finder/IntelliJ style). Only has an
+    /// effect when `folder_icons` is true.
+    ///
+    /// Default: false
+    pub folder_chevrons: Option<bool>,
     /// Whether to show the git status in the project panel.
     ///
     /// Default: true

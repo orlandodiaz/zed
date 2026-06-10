@@ -743,6 +743,9 @@
     "file_icons": true,
     // Whether to show folder icons or chevrons for directories in the project panel.
     "folder_icons": true,
+    // Whether to show a disclosure chevron before the folder icon for directories
+    // in the project panel (Finder/IntelliJ style). Only applies when "folder_icons" is true.
+    "folder_chevrons": false,
     // Whether to show the git status in the project panel.
     "git_status": true,
     // Amount of indentation for nested items.

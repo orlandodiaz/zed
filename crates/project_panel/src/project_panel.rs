@@ -5809,6 +5809,24 @@ impl ProjectPanel {
                             )
                         },
                     )
+                    .when(settings.folder_chevrons && settings.folder_icons, |this| {
+                        this.child(if kind.is_dir() {
+                            Icon::new(if details.is_expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .color(Color::Muted)
+                            .size(IconSize::Small)
+                            .into_any_element()
+                        } else {
+                            // Keep file icons aligned under folder icons.
+                            h_flex()
+                                .size(IconSize::Small.rems())
+                                .flex_none()
+                                .into_any_element()
+                        })
+                    })
                     .child(if let Some(icon) = &icon {
                         if let Some((_, decoration_color)) =
                             entry_diagnostic_aware_icon_decoration_and_color(diagnostic_severity)
