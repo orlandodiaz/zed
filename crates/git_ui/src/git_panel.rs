@@ -5341,11 +5341,17 @@ impl GitPanel {
                 cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.selected_entry = Some(ix);
                     cx.notify();
-                    if event.click_count() > 1 || event.modifiers().secondary() {
-                        this.open_diff(&Default::default(), window, cx);
-                        this.focus_handle.focus(window, cx);
-                    } else {
-                        this.open_file(&Default::default(), window, cx)
+                    match entry_click_action(
+                        event.click_count(),
+                        event.modifiers().secondary(),
+                    ) {
+                        EntryClickAction::OpenDiff => {
+                            this.open_diff(&Default::default(), window, cx);
+                            this.focus_handle.focus(window, cx);
+                        }
+                        EntryClickAction::OpenFile => {
+                            this.open_file(&Default::default(), window, cx)
+                        }
                     }
                 })
             })
@@ -6601,6 +6607,25 @@ fn format_git_error_toast_message(error: &anyhow::Error) -> String {
     }
 }
 
+/// Which action a click on a changed-file row in the git panel resolves to.
+#[derive(Debug, PartialEq, Eq)]
+enum EntryClickAction {
+    /// Open just the clicked file's diff.
+    OpenFile,
+    /// Open the all-files project diff.
+    OpenDiff,
+}
+
+/// A single click opens the file's own diff; a double click or a click with the
+/// platform secondary modifier opens the all-files project diff.
+fn entry_click_action(click_count: usize, secondary_modifier: bool) -> EntryClickAction {
+    if click_count > 1 || secondary_modifier {
+        EntryClickAction::OpenDiff
+    } else {
+        EntryClickAction::OpenFile
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use git::{
@@ -6619,6 +6644,17 @@ mod tests {
     use workspace::MultiWorkspace;
 
     use super::*;
+
+    #[test]
+    fn test_entry_click_action() {
+        // Single click opens just the clicked file's diff.
+        assert_eq!(entry_click_action(1, false), EntryClickAction::OpenFile);
+        // Double click opens the all-files project diff.
+        assert_eq!(entry_click_action(2, false), EntryClickAction::OpenDiff);
+        // A secondary-modifier (e.g. cmd) click also opens the all-files diff.
+        assert_eq!(entry_click_action(1, true), EntryClickAction::OpenDiff);
+        assert_eq!(entry_click_action(2, true), EntryClickAction::OpenDiff);
+    }
 
     fn init_test(cx: &mut gpui::TestAppContext) {
         zlog::init_test();
