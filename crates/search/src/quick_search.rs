@@ -611,3 +611,71 @@ fn save_history_on_dismiss(
         cx.emit(DismissEvent);
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    #[gpui::test]
+    async fn test_deploy_in_directory_prefills_include_filter(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "src": { "main.rs": "fn main() {}" },
+                "README.md": "",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        // Deploy the quick search popup scoped to the "src" directory.
+        workspace.update_in(cx, |workspace, window, cx| {
+            QuickSearch::deploy_in_directory(workspace, "src".to_string(), window, cx);
+        });
+        cx.run_until_parked();
+
+        // The quick search modal should now be active, with the include filter
+        // pre-filled with the directory and the filter row revealed.
+        let quick_search = workspace
+            .update(cx, |workspace, cx| workspace.active_modal::<QuickSearch>(cx))
+            .expect("quick search modal should be active after deploy_in_directory");
+
+        quick_search.update(cx, |quick_search, cx| {
+            let delegate = &quick_search.picker.read(cx).delegate;
+            assert!(
+                delegate.filters_enabled,
+                "filters should be enabled when deploying in a directory"
+            );
+            assert_eq!(
+                delegate.included_files_editor.text(cx),
+                "src",
+                "include filter should be pre-filled with the directory path"
+            );
+        });
+    }
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+    }
+}
