@@ -400,6 +400,12 @@ impl<D: PickerDelegate> Picker<D> {
         )
     }
 
+    /// Whether this picker shows a preview pane (built via
+    /// [`uniform_list_with_preview`](Self::uniform_list_with_preview)).
+    pub fn has_preview(&self) -> bool {
+        self.preview.is_some()
+    }
+
     /// A picker, which displays its matches using `gpui::uniform_list`, all matches should have the same height.
     /// If `PickerDelegate::render_match` can return items with different heights, use `Picker::list`.
     pub fn nonsearchable_uniform_list(

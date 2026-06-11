@@ -3786,6 +3786,32 @@ async fn open_queried_buffer(
     history_items
 }
 
+#[gpui::test]
+async fn test_file_finder_has_no_preview(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "a.rs": "",
+                "b.rs": "",
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, _workspace, cx) = build_find_picker(project, cx);
+
+    picker.update(cx, |picker, _| {
+        assert!(
+            !picker.has_preview(),
+            "file finder picker should not show a preview pane"
+        );
+    });
+}
+
 fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
     cx.update(|cx| {
         let state = AppState::test(cx);
