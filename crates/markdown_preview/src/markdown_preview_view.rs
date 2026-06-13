@@ -21,7 +21,7 @@ use markdown::{
 use project::search::SearchQuery;
 use settings::Settings;
 use theme_settings::ThemeSettings;
-use ui::{ContextMenu, WithScrollbar, prelude::*, right_click_menu};
+use ui::{ContextMenu, WithScrollbar, prelude::*, right_click_menu, utils::WithRemSize};
 use util::markdown::split_local_url_fragment;
 use util::normalize_path;
 use workspace::item::{Item, ItemBufferKind, ItemHandle};
@@ -878,6 +878,9 @@ impl Item for MarkdownPreviewView {
 
 impl Render for MarkdownPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Headings (and other rems-based sizes) scale with the rem size; body
+        // and code use absolute sizes and are unaffected. Shrink headings a bit.
+        let rem_size = window.rem_size() * 0.85;
         div()
             .image_cache(self.image_cache.clone())
             .id("MarkdownPreview")
@@ -900,7 +903,7 @@ impl Render for MarkdownPreviewView {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
                     .p_4()
-                    .child({
+                    .child(WithRemSize::new(rem_size).child({
                         let markdown_element = self.render_markdown_element(window, cx);
                         let markdown = self.markdown.clone();
                         right_click_menu("markdown-preview-context-menu")
@@ -920,7 +923,7 @@ impl Render for MarkdownPreviewView {
                                         })
                                 })
                             })
-                    }),
+                    })),
             )
             .vertical_scrollbar_for(&self.scroll_handle, window, cx)
     }
