@@ -60,7 +60,9 @@ actions!(
         /// Toggles the file filter menu.
         ToggleFilterMenu,
         /// Toggles the split direction menu.
-        ToggleSplitMenu
+        ToggleSplitMenu,
+        /// Toggles whether directories are included in file finder results.
+        ToggleIncludeDirectories
     ]
 );
 
@@ -282,6 +284,19 @@ impl FileFinder {
         });
     }
 
+    fn handle_toggle_directories(
+        &mut self,
+        _: &ToggleIncludeDirectories,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.picker.update(cx, |picker, cx| {
+            picker.delegate.include_directories = !picker.delegate.include_directories;
+            picker.delegate.include_directories_refresh =
+                picker.delegate.update_matches(picker.query(cx), window, cx);
+        });
+    }
+
     fn go_to_file_split_left(
         &mut self,
         _: &pane::SplitLeft,
@@ -385,6 +400,7 @@ impl Render for FileFinder {
             .on_action(cx.listener(Self::handle_filter_toggle_menu))
             .on_action(cx.listener(Self::handle_split_toggle_menu))
             .on_action(cx.listener(Self::handle_toggle_ignored))
+            .on_action(cx.listener(Self::handle_toggle_directories))
             .on_action(cx.listener(Self::go_to_file_split_left))
             .on_action(cx.listener(Self::go_to_file_split_right))
             .on_action(cx.listener(Self::go_to_file_split_up))
@@ -415,6 +431,8 @@ pub struct FileFinderDelegate {
     focus_handle: FocusHandle,
     include_ignored: Option<bool>,
     include_ignored_refresh: Task<()>,
+    include_directories: bool,
+    include_directories_refresh: Task<()>,
 }
 
 /// Use a custom ordering for file finder: the regular one
@@ -810,6 +828,8 @@ struct FileSearchQuery {
     raw_query: String,
     file_query_end: Option<usize>,
     path_position: PathWithPosition,
+    /// Set when the query ended with `/`, meaning only directories should match.
+    directories_only: bool,
 }
 
 impl FileSearchQuery {
@@ -860,6 +880,8 @@ impl FileFinderDelegate {
             focus_handle: cx.focus_handle(),
             include_ignored: FileFinderSettings::get_global(cx).include_ignored,
             include_ignored_refresh: Task::ready(()),
+            include_directories: FileFinderSettings::get_global(cx).include_directories,
+            include_directories_refresh: Task::ready(()),
         }
     }
 
@@ -897,6 +919,8 @@ impl FileFinderDelegate {
             .visible_worktrees_and_single_files(cx)
             .collect::<Vec<_>>();
         let include_root_name = !should_hide_root_in_entry_path(&worktree_store, cx);
+        let directories_only = query.directories_only;
+        let include_directories = self.include_directories;
         let candidate_sets = worktrees
             .into_iter()
             .map(|worktree| {
@@ -907,7 +931,13 @@ impl FileFinderDelegate {
                         worktree.root_entry().is_some_and(|entry| entry.is_ignored)
                     }),
                     include_root_name,
-                    candidates: project::Candidates::Files,
+                    candidates: if directories_only {
+                        project::Candidates::Directories
+                    } else if include_directories {
+                        project::Candidates::Entries
+                    } else {
+                        project::Candidates::Files
+                    },
                 }
             })
             .collect::<Vec<_>>();
@@ -1492,6 +1522,9 @@ impl PickerDelegate for FileFinderDelegate {
             cx.notify();
             Task::ready(())
         } else {
+            // A trailing slash means "match directories only" (e.g. `foo/`).
+            let directories_only = raw_query.ends_with('/');
+            let raw_query = raw_query.trim_end_matches('/');
             let path_position = PathWithPosition::parse_str(raw_query);
             let raw_query = raw_query.trim().trim_end_matches(':').to_owned();
             let path = path_position.path.clone();
@@ -1508,6 +1541,7 @@ impl PickerDelegate for FileFinderDelegate {
                 raw_query,
                 file_query_end,
                 path_position,
+                directories_only,
             };
 
             cx.spawn_in(window, async move |this, cx| {
@@ -1552,6 +1586,30 @@ impl PickerDelegate for FileFinderDelegate {
                 let finder = self.file_finder.clone();
                 window.dispatch_action(OpenChannelNotesById { channel_id }.boxed_clone(), cx);
                 finder.update(cx, |_, cx| cx.emit(DismissEvent)).log_err();
+                return;
+            }
+
+            // Directories can't be opened as files — reveal them in the project panel.
+            if let Match::Search(m) = m
+                && m.0.is_dir
+            {
+                let project_path = ProjectPath {
+                    worktree_id: WorktreeId::from_usize(m.0.worktree_id),
+                    path: m.0.path.clone(),
+                };
+                let project = workspace.read(cx).project().clone();
+                if let Some(entry_id) = project
+                    .read(cx)
+                    .entry_for_path(&project_path, cx)
+                    .map(|entry| entry.id)
+                {
+                    project.update(cx, |_, cx| {
+                        cx.emit(project::Event::RevealInProjectPanel(entry_id));
+                    });
+                }
+                self.file_finder
+                    .update(cx, |_, cx| cx.emit(DismissEvent))
+                    .log_err();
                 return;
             }
 
@@ -1738,6 +1796,19 @@ impl PickerDelegate for FileFinderDelegate {
 
         let file_icon = match path_match {
             Match::Channel { .. } => Some(Icon::new(IconName::Hash).color(Color::Muted)),
+            Match::Search(m) if m.0.is_dir => {
+                if settings.file_icons {
+                    let themed = path_match
+                        .abs_path(&self.project, cx)
+                        .and_then(|abs_path| FileIcons::get_folder_icon(false, &abs_path, cx))
+                        .map(|icon| Icon::from_path(icon).color(Color::Muted));
+                    Some(themed.unwrap_or_else(|| {
+                        Icon::new(IconName::Folder).color(Color::Muted)
+                    }))
+                } else {
+                    None
+                }
+            }
             _ => maybe!({
                 if !settings.file_icons {
                     return None;
@@ -1808,6 +1879,7 @@ impl PickerDelegate for FileFinderDelegate {
                         .menu({
                             let focus_handle = focus_handle.clone();
                             let include_ignored = self.include_ignored;
+                            let include_directories = self.include_directories;
 
                             move |window, cx| {
                                 Some(ContextMenu::build(window, cx, {
@@ -1820,12 +1892,31 @@ impl PickerDelegate for FileFinderDelegate {
                                                 include_ignored.unwrap_or(false),
                                                 ui::IconPosition::End,
                                                 Some(ToggleIncludeIgnored.boxed_clone()),
-                                                move |window, cx| {
-                                                    window.focus(&focus_handle, cx);
-                                                    window.dispatch_action(
-                                                        ToggleIncludeIgnored.boxed_clone(),
-                                                        cx,
-                                                    );
+                                                {
+                                                    let focus_handle = focus_handle.clone();
+                                                    move |window, cx| {
+                                                        window.focus(&focus_handle, cx);
+                                                        window.dispatch_action(
+                                                            ToggleIncludeIgnored.boxed_clone(),
+                                                            cx,
+                                                        );
+                                                    }
+                                                },
+                                            )
+                                            .toggleable_entry(
+                                                "Include Directories",
+                                                include_directories,
+                                                ui::IconPosition::End,
+                                                Some(ToggleIncludeDirectories.boxed_clone()),
+                                                {
+                                                    let focus_handle = focus_handle.clone();
+                                                    move |window, cx| {
+                                                        window.focus(&focus_handle, cx);
+                                                        window.dispatch_action(
+                                                            ToggleIncludeDirectories.boxed_clone(),
+                                                            cx,
+                                                        );
+                                                    }
                                                 },
                                             )
                                     }

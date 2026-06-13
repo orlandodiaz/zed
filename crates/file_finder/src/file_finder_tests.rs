@@ -3812,6 +3812,115 @@ async fn test_file_finder_has_no_preview(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+async fn test_file_finder_includes_directories(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "alpha": { "inside.rs": "" },
+                "alphabet.rs": "",
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, _workspace, cx) = build_find_picker(project, cx);
+
+    cx.simulate_input("alpha");
+    picker.update(cx, |picker, _| {
+        let has_directory = picker
+            .delegate
+            .matches
+            .matches
+            .iter()
+            .any(|m| matches!(m, Match::Search(pm) if pm.0.is_dir));
+        assert!(
+            has_directory,
+            "expected the `alpha` directory to appear in the results"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_file_finder_trailing_slash_lists_only_directories(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "alpha": { "inside.rs": "" },
+                "alphabet.rs": "",
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, _workspace, cx) = build_find_picker(project, cx);
+
+    cx.simulate_input("alpha/");
+    picker.update(cx, |picker, _| {
+        let search_matches: Vec<_> = picker
+            .delegate
+            .matches
+            .matches
+            .iter()
+            .filter_map(|m| match m {
+                Match::Search(pm) => Some(pm),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !search_matches.is_empty(),
+            "expected directory matches for `alpha/`"
+        );
+        assert!(
+            search_matches.iter().all(|pm| pm.0.is_dir),
+            "a trailing slash should match directories only"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_file_finder_excludes_directories_when_disabled(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "alpha": { "inside.rs": "" },
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, _workspace, cx) = build_find_picker(project, cx);
+
+    picker.update(cx, |picker, _| {
+        picker.delegate.include_directories = false;
+    });
+    cx.simulate_input("alpha");
+    picker.update(cx, |picker, _| {
+        let has_directory = picker
+            .delegate
+            .matches
+            .matches
+            .iter()
+            .any(|m| matches!(m, Match::Search(pm) if pm.0.is_dir));
+        assert!(
+            !has_directory,
+            "directories should be excluded when include_directories is off"
+        );
+    });
+}
+
 fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
     cx.update(|cx| {
         let state = AppState::test(cx);
@@ -3833,6 +3942,7 @@ fn test_path_position(test_str: &str) -> FileSearchQuery {
             Some(path_position.path.to_str().unwrap().len())
         },
         path_position,
+        directories_only: false,
     }
 }
 

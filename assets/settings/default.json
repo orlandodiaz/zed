@@ -1350,6 +1350,9 @@
     "include_ignored": "smart",
     // Whether to include text channels in file finder results.
     "include_channels": false,
+    // Whether to include directories in file finder results (selecting one reveals
+    // it in the project panel). A trailing "/" always matches directories only.
+    "include_directories": true,
   },
   // Whether or not to remove any trailing whitespace from lines of a buffer
   // before saving it.

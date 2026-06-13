@@ -723,6 +723,12 @@ pub struct FileFinderSettingsContent {
     ///
     /// Default: false
     pub include_channels: Option<bool>,
+    /// Whether to include directories in file finder results (selecting one
+    /// reveals it in the project panel). A trailing `/` always matches
+    /// directories only, regardless of this setting.
+    ///
+    /// Default: true
+    pub include_directories: Option<bool>,
 }
 
 #[derive(

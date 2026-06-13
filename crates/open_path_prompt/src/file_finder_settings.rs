@@ -9,6 +9,7 @@ pub struct FileFinderSettings {
     pub skip_focus_for_active_in_search: bool,
     pub include_ignored: Option<bool>,
     pub include_channels: bool,
+    pub include_directories: bool,
 }
 
 impl Settings for FileFinderSettings {
@@ -25,6 +26,7 @@ impl Settings for FileFinderSettings {
                 settings::IncludeIgnoredContent::Smart => None,
             },
             include_channels: file_finder.include_channels.unwrap(),
+            include_directories: file_finder.include_directories.unwrap(),
         }
     }
 }
