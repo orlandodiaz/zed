@@ -1,3 +1,4 @@
+mod manual_order;
 pub mod project_panel_settings;
 mod undo;
 mod utils;
@@ -153,6 +154,9 @@ pub struct ProjectPanel {
     diagnostics: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticSeverity>,
     diagnostic_counts: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticCount>,
     diagnostic_summary_update: Task<()>,
+    // Per-worktree manual ordering of entries (drag/move-to-reorder), loaded
+    // from and persisted to `<worktree-root>/.zed/panel-order.json`.
+    manual_orders: HashMap<WorktreeId, manual_order::ManualOrder>,
     // We keep track of the mouse down state on entries so we don't flash the UI
     // in case a user clicks to open a file.
     mouse_down: bool,
@@ -403,6 +407,10 @@ actions!(
         Undo,
         /// Redoes the last undone file operation.
         Redo,
+        /// Moves the selected entry up within its directory (manual ordering).
+        MoveEntryUp,
+        /// Moves the selected entry down within its directory (manual ordering).
+        MoveEntryDown,
     ]
 );
 
@@ -882,6 +890,7 @@ impl ProjectPanel {
                 diagnostics: Default::default(),
                 diagnostic_counts: Default::default(),
                 diagnostic_summary_update: Task::ready(()),
+                manual_orders: Default::default(),
                 scroll_handle,
                 mouse_down: false,
                 hover_expand_task: None,
@@ -902,6 +911,7 @@ impl ProjectPanel {
                 undo_manager: UndoManager::new(workspace.weak_handle(), weak_project_panel, &cx),
             };
             this.update_visible_entries(None, false, false, window, cx);
+            this.load_manual_orders(window, cx);
 
             this
         });
@@ -1153,6 +1163,9 @@ impl ProjectPanel {
                                 menu.action("Open in Default App", Box::new(OpenWithSystem))
                             })
                             .action("Open in Terminal", Box::new(OpenInTerminal))
+                            .separator()
+                            .action("Move Up", Box::new(MoveEntryUp))
+                            .action("Move Down", Box::new(MoveEntryDown))
                             .when(is_dir, |menu| {
                                 menu.separator()
                                     .action("Find in Folder…", Box::new(NewSearchInDirectory))
@@ -3937,6 +3950,107 @@ impl ProjectPanel {
         }
     }
 
+    fn load_manual_orders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fs = self.fs.clone();
+        let worktrees: Vec<(WorktreeId, Arc<Path>)> = self
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .map(|worktree| {
+                let worktree = worktree.read(cx);
+                (worktree.id(), worktree.abs_path())
+            })
+            .collect();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut orders: HashMap<WorktreeId, manual_order::ManualOrder> = HashMap::default();
+            for (worktree_id, abs_path) in worktrees {
+                let path = abs_path.join(manual_order::MANUAL_ORDER_REL_PATH);
+                if let Ok(text) = fs.load(&path).await {
+                    orders.insert(worktree_id, manual_order::ManualOrder::from_json(&text));
+                }
+            }
+            if orders.is_empty() {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.manual_orders = orders;
+                this.update_visible_entries(None, false, false, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn move_entry_up(&mut self, _: &MoveEntryUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_selected_entry(-1, window, cx);
+    }
+
+    fn move_entry_down(&mut self, _: &MoveEntryDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_selected_entry(1, window, cx);
+    }
+
+    fn move_selected_entry(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let worktree_id = selection.worktree_id;
+        let Some(worktree) = self.project.read(cx).worktree_for_id(worktree_id, cx) else {
+            return;
+        };
+        let (name, parent, abs_path) = {
+            let worktree = worktree.read(cx);
+            let Some(entry) = worktree.entry_for_id(selection.entry_id) else {
+                return;
+            };
+            let Some(name) = entry.path.file_name().map(|name| name.to_string()) else {
+                return;
+            };
+            let parent = entry
+                .path
+                .parent()
+                .map(|parent| parent.as_unix_str().to_string())
+                .unwrap_or_default();
+            (name, parent, worktree.abs_path())
+        };
+
+        // Sibling names in their current display order.
+        let siblings: Vec<String> = self
+            .state
+            .visible_entries
+            .iter()
+            .find(|entries| entries.worktree_id == worktree_id)
+            .map(|entries| {
+                entries
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.path.parent().map(|p| p.as_unix_str()).unwrap_or("")
+                            == parent.as_str()
+                    })
+                    .filter_map(|entry| entry.path.file_name().map(|name| name.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let order = self.manual_orders.entry(worktree_id).or_default();
+        if !order.move_within(&parent, &name, delta, &siblings) {
+            return;
+        }
+        let json = order.to_json();
+
+        let fs = self.fs.clone();
+        let path = abs_path.join(manual_order::MANUAL_ORDER_REL_PATH);
+        cx.background_spawn(async move {
+            if let Some(dir) = path.parent() {
+                fs.create_dir(dir).await.ok();
+            }
+            fs.atomic_write(path, json).await.ok();
+        })
+        .detach();
+
+        self.update_visible_entries(None, false, false, window, cx);
+    }
+
     fn update_visible_entries(
         &mut self,
         new_selected_entry: Option<(WorktreeId, ProjectEntryId)>,
@@ -3951,6 +4065,7 @@ impl ProjectPanel {
         let hide_gitignore = settings.hide_gitignore;
         let sort_mode = settings.sort_mode;
         let sort_order = settings.sort_order;
+        let manual_orders = self.manual_orders.clone();
         let project = self.project.read(cx);
         let repo_snapshots = project.git_store().read(cx).repo_snapshots(cx);
 
@@ -4182,11 +4297,23 @@ impl ProjectPanel {
                             entry_iter.advance();
                         }
 
-                        par_sort_worktree_entries(
-                            &mut visible_worktree_entries,
-                            sort_mode,
-                            sort_order,
-                        );
+                        match manual_orders.get(&worktree_id) {
+                            Some(manual) if !manual.is_empty() => {
+                                par_sort_worktree_entries_with_order(
+                                    &mut visible_worktree_entries,
+                                    sort_mode,
+                                    sort_order,
+                                    manual,
+                                );
+                            }
+                            _ => {
+                                par_sort_worktree_entries(
+                                    &mut visible_worktree_entries,
+                                    sort_mode,
+                                    sort_order,
+                                );
+                            }
+                        }
                         new_state.visible_entries.push(VisibleEntriesForWorktree {
                             worktree_id,
                             entries: visible_worktree_entries,
@@ -6679,6 +6806,8 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::collapse_selected_entry))
                 .on_action(cx.listener(Self::collapse_all_entries))
                 .on_action(cx.listener(Self::collapse_selected_entry_and_children))
+                .on_action(cx.listener(Self::move_entry_up))
+                .on_action(cx.listener(Self::move_entry_down))
                 .on_action(cx.listener(Self::open))
                 .on_action(cx.listener(Self::open_permanent))
                 .on_action(cx.listener(Self::open_split_vertical))
@@ -7359,6 +7488,56 @@ pub fn par_sort_worktree_entries(
     order: settings::ProjectPanelSortOrder,
 ) {
     entries.par_sort_by(|lhs, rhs| cmp_worktree_entries(lhs, rhs, &mode, &order));
+}
+
+/// Like [`cmp_worktree_entries`], but applies a directory's manual ordering at
+/// the first path component where two entries diverge (i.e. for siblings under
+/// a manually-ordered parent). Falls back to the automatic sort otherwise.
+fn cmp_worktree_entries_with_order(
+    a: &Entry,
+    b: &Entry,
+    mode: &settings::ProjectPanelSortMode,
+    order: &settings::ProjectPanelSortOrder,
+    manual: &manual_order::ManualOrder,
+) -> cmp::Ordering {
+    if !manual.is_empty() {
+        let mut a_components = a.path.components();
+        let mut b_components = b.path.components();
+        let mut parent = String::new();
+        loop {
+            match (a_components.next(), b_components.next()) {
+                (Some(a_component), Some(b_component)) if a_component == b_component => {
+                    if !parent.is_empty() {
+                        parent.push('/');
+                    }
+                    parent.push_str(a_component);
+                }
+                (Some(a_component), Some(b_component)) => {
+                    match (
+                        manual.rank(&parent, a_component),
+                        manual.rank(&parent, b_component),
+                    ) {
+                        (Some(a_rank), Some(b_rank)) => return a_rank.cmp(&b_rank),
+                        (Some(_), None) => return cmp::Ordering::Less,
+                        (None, Some(_)) => return cmp::Ordering::Greater,
+                        (None, None) => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+    cmp_worktree_entries(a, b, mode, order)
+}
+
+fn par_sort_worktree_entries_with_order(
+    entries: &mut Vec<GitEntry>,
+    mode: settings::ProjectPanelSortMode,
+    order: settings::ProjectPanelSortOrder,
+    manual: &manual_order::ManualOrder,
+) {
+    entries
+        .par_sort_by(|lhs, rhs| cmp_worktree_entries_with_order(lhs, rhs, &mode, &order, manual));
 }
 
 fn git_status_indicator(git_status: GitSummary) -> Option<(&'static str, Color)> {
