@@ -1443,10 +1443,6 @@
       "cmd-up": "markdown::ScrollToTop",
       "cmd-down": "markdown::ScrollToBottom",
       "cmd-f": "buffer_search::Deploy",
-      "cmd-=": "markdown::ZoomIn",
-      "cmd-+": "markdown::ZoomIn",
-      "cmd--": "markdown::ZoomOut",
-      "cmd-0": "markdown::ResetZoom",
     },
   },
   {
