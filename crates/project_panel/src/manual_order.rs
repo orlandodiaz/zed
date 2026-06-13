@@ -35,19 +35,11 @@ impl ManualOrder {
         self.dirs.get(dir)?.iter().position(|listed| listed == name)
     }
 
-    /// Move `name` within `dir` by `delta` (negative = earlier/up).
-    ///
-    /// `siblings` is the directory's children in their current display order.
-    /// The first move materializes that order so untouched siblings keep their
-    /// relative positions; subsequent calls reconcile added/removed children.
-    /// Returns true if the order changed.
-    pub fn move_within(
-        &mut self,
-        dir: &str,
-        name: &str,
-        delta: isize,
-        siblings: &[impl AsRef<str>],
-    ) -> bool {
+    /// Returns `dir`'s order list, reconciled against the current `siblings`
+    /// (display order). The first call materializes the display order so
+    /// untouched siblings keep their relative positions; later calls append new
+    /// siblings and drop ones that no longer exist.
+    fn reconciled(&mut self, dir: &str, siblings: &[impl AsRef<str>]) -> &mut Vec<String> {
         let order = self.dirs.entry(dir.to_string()).or_default();
         if order.is_empty() {
             *order = siblings.iter().map(|s| s.as_ref().to_string()).collect();
@@ -60,7 +52,19 @@ impl ManualOrder {
             }
             order.retain(|listed| siblings.iter().any(|s| s.as_ref() == listed));
         }
+        order
+    }
 
+    /// Move `name` within `dir` by `delta` (negative = earlier/up). Returns true
+    /// if the order changed.
+    pub fn move_within(
+        &mut self,
+        dir: &str,
+        name: &str,
+        delta: isize,
+        siblings: &[impl AsRef<str>],
+    ) -> bool {
+        let order = self.reconciled(dir, siblings);
         let Some(index) = order.iter().position(|listed| listed == name) else {
             return false;
         };
@@ -69,6 +73,35 @@ impl ManualOrder {
             return false;
         }
         order.swap(index, target as usize);
+        true
+    }
+
+    /// Move `name` to immediately before (or after) `anchor` within `dir`.
+    /// Returns true if the order changed.
+    pub fn reorder(
+        &mut self,
+        dir: &str,
+        name: &str,
+        anchor: &str,
+        before: bool,
+        siblings: &[impl AsRef<str>],
+    ) -> bool {
+        if name == anchor {
+            return false;
+        }
+        let order = self.reconciled(dir, siblings);
+        let Some(from) = order.iter().position(|listed| listed == name) else {
+            return false;
+        };
+        let item = order.remove(from);
+        let Some(mut anchor_index) = order.iter().position(|listed| listed == anchor) else {
+            order.insert(from.min(order.len()), item);
+            return false;
+        };
+        if !before {
+            anchor_index += 1;
+        }
+        order.insert(anchor_index.min(order.len()), item);
         true
     }
 }

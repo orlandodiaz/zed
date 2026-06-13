@@ -144,6 +144,7 @@ pub struct ProjectPanel {
     rendered_entries_len: usize,
     folded_directory_drag_target: Option<FoldedDirectoryDragTarget>,
     drag_target_entry: Option<DragTarget>,
+    drag_insertion: Option<DragInsertion>,
     marked_entries: Vec<SelectedEntry>,
     selection: Option<SelectedEntry>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
@@ -201,6 +202,15 @@ enum DragTarget {
     },
     /// Dragging on background
     Background,
+}
+
+/// Where a dragged entry will be inserted when reordering siblings.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct DragInsertion {
+    /// The sibling the dragged entry will land next to.
+    entry_id: ProjectEntryId,
+    /// Insert before (above) the anchor when true, after (below) when false.
+    before: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -880,6 +890,7 @@ impl ProjectPanel {
                 rendered_entries_len: 0,
                 folded_directory_drag_target: None,
                 drag_target_entry: None,
+                drag_insertion: None,
                 marked_entries: Default::default(),
                 selection: None,
                 context_menu: None,
@@ -3994,28 +4005,41 @@ impl ProjectPanel {
             return;
         };
         let worktree_id = selection.worktree_id;
-        let Some(worktree) = self.project.read(cx).worktree_for_id(worktree_id, cx) else {
+        let Some((name, parent, abs_path)) = self.entry_order_info(worktree_id, selection.entry_id, cx)
+        else {
             return;
         };
-        let (name, parent, abs_path) = {
-            let worktree = worktree.read(cx);
-            let Some(entry) = worktree.entry_for_id(selection.entry_id) else {
-                return;
-            };
-            let Some(name) = entry.path.file_name().map(|name| name.to_string()) else {
-                return;
-            };
-            let parent = entry
-                .path
-                .parent()
-                .map(|parent| parent.as_unix_str().to_string())
-                .unwrap_or_default();
-            (name, parent, worktree.abs_path())
-        };
+        let siblings = self.siblings_in_display_order(worktree_id, &parent);
+        let order = self.manual_orders.entry(worktree_id).or_default();
+        if !order.move_within(&parent, &name, delta, &siblings) {
+            return;
+        }
+        self.persist_manual_order(worktree_id, abs_path, cx);
+        self.update_visible_entries(None, false, false, window, cx);
+    }
 
-        // Sibling names in their current display order.
-        let siblings: Vec<String> = self
-            .state
+    /// (file name, parent dir path, worktree abs path) for an entry, if present.
+    fn entry_order_info(
+        &self,
+        worktree_id: WorktreeId,
+        entry_id: ProjectEntryId,
+        cx: &App,
+    ) -> Option<(String, String, Arc<Path>)> {
+        let worktree = self.project.read(cx).worktree_for_id(worktree_id, cx)?;
+        let worktree = worktree.read(cx);
+        let entry = worktree.entry_for_id(entry_id)?;
+        let name = entry.path.file_name()?.to_string();
+        let parent = entry
+            .path
+            .parent()
+            .map(|parent| parent.as_unix_str().to_string())
+            .unwrap_or_default();
+        Some((name, parent, worktree.abs_path()))
+    }
+
+    /// Child names of `parent` (within `worktree_id`) in their current display order.
+    fn siblings_in_display_order(&self, worktree_id: WorktreeId, parent: &str) -> Vec<String> {
+        self.state
             .visible_entries
             .iter()
             .find(|entries| entries.worktree_id == worktree_id)
@@ -4024,20 +4048,24 @@ impl ProjectPanel {
                     .entries
                     .iter()
                     .filter(|entry| {
-                        entry.path.parent().map(|p| p.as_unix_str()).unwrap_or("")
-                            == parent.as_str()
+                        entry.path.parent().map(|p| p.as_unix_str()).unwrap_or("") == parent
                     })
                     .filter_map(|entry| entry.path.file_name().map(|name| name.to_string()))
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
 
-        let order = self.manual_orders.entry(worktree_id).or_default();
-        if !order.move_within(&parent, &name, delta, &siblings) {
+    fn persist_manual_order(
+        &self,
+        worktree_id: WorktreeId,
+        abs_path: Arc<Path>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(order) = self.manual_orders.get(&worktree_id) else {
             return;
-        }
+        };
         let json = order.to_json();
-
         let fs = self.fs.clone();
         let path = abs_path.join(manual_order::MANUAL_ORDER_REL_PATH);
         cx.background_spawn(async move {
@@ -4047,7 +4075,94 @@ impl ProjectPanel {
             fs.atomic_write(path, json).await.ok();
         })
         .detach();
+    }
 
+    /// While dragging an entry, decide whether the cursor is in a reorder zone
+    /// relative to `row_entry_id` (a sibling), returning where it would insert.
+    /// Returns `None` to fall back to the move-into-folder drag behavior.
+    fn drag_reorder_insertion(
+        &self,
+        dragged: &DraggedSelection,
+        row_worktree_id: WorktreeId,
+        row_entry_id: ProjectEntryId,
+        row_is_dir: bool,
+        bounds: Bounds<Pixels>,
+        position: Point<Pixels>,
+        cx: &App,
+    ) -> Option<DragInsertion> {
+        if dragged.items().count() != 1
+            || dragged.active_selection.worktree_id != row_worktree_id
+            || dragged.active_selection.entry_id == row_entry_id
+        {
+            return None;
+        }
+        let worktree = self
+            .project
+            .read(cx)
+            .worktree_for_id(row_worktree_id, cx)?
+            .read(cx);
+        let dragged_parent = worktree
+            .entry_for_id(dragged.active_selection.entry_id)?
+            .path
+            .parent()
+            .map(|p| p.as_unix_str().to_string())
+            .unwrap_or_default();
+        let row_parent = worktree
+            .entry_for_id(row_entry_id)?
+            .path
+            .parent()
+            .map(|p| p.as_unix_str().to_string())
+            .unwrap_or_default();
+        // Only siblings reorder; cross-directory drags keep move-into behavior.
+        if dragged_parent != row_parent {
+            return None;
+        }
+        let rel = if bounds.size.height > px(0.) {
+            ((position.y - bounds.origin.y) / bounds.size.height).clamp(0., 1.)
+        } else {
+            0.5
+        };
+        let before = if row_is_dir {
+            // Middle band of a directory row means "drop into" — keep moving.
+            if rel < 0.25 {
+                true
+            } else if rel > 0.75 {
+                false
+            } else {
+                return None;
+            }
+        } else {
+            rel < 0.5
+        };
+        Some(DragInsertion {
+            entry_id: row_entry_id,
+            before,
+        })
+    }
+
+    fn reorder_via_drag(
+        &mut self,
+        dragged: &DraggedSelection,
+        insertion: DragInsertion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let worktree_id = dragged.active_selection.worktree_id;
+        let Some((name, parent, abs_path)) =
+            self.entry_order_info(worktree_id, dragged.active_selection.entry_id, cx)
+        else {
+            return;
+        };
+        let Some((anchor_name, _, _)) = self.entry_order_info(worktree_id, insertion.entry_id, cx)
+        else {
+            return;
+        };
+        let siblings = self.siblings_in_display_order(worktree_id, &parent);
+        let order = self.manual_orders.entry(worktree_id).or_default();
+        if !order.reorder(&parent, &name, &anchor_name, insertion.before, &siblings) {
+            return;
+        }
+        self.persist_manual_order(worktree_id, abs_path, cx);
         self.update_visible_entries(None, false, false, window, cx);
     }
 
@@ -5535,6 +5650,10 @@ impl ProjectPanel {
             (entry_id.to_proto() as usize).into()
         };
 
+        let drag_insertion = self
+            .drag_insertion
+            .filter(|insertion| insertion.entry_id == entry_id);
+        let insertion_line_color = cx.theme().colors().text_accent;
         div()
             .id(id.clone())
             .relative()
@@ -5545,6 +5664,23 @@ impl ProjectPanel {
             .border_1()
             .border_r_2()
             .border_color(border_color)
+            .when_some(drag_insertion, |this, insertion| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .h(px(2.))
+                        .bg(insertion_line_color)
+                        .map(|line| {
+                            if insertion.before {
+                                line.top_0()
+                            } else {
+                                line.bottom_0()
+                            }
+                        }),
+                )
+            })
             .hover(|style| style.bg(bg_hover_color).border_color(border_hover_color))
             .when(is_sticky, |this| this.block_mouse_except_scroll())
             .when(!is_sticky, |this| {
@@ -5636,7 +5772,36 @@ impl ProjectPanel {
                                 if is_current_target {
                                     this.drag_target_entry = None;
                                 }
+                                if this
+                                    .drag_insertion
+                                    .is_some_and(|insertion| insertion.entry_id == entry_id)
+                                {
+                                    this.drag_insertion = None;
+                                    cx.notify();
+                                }
                                 return;
+                            }
+
+                            // If the cursor is in a sibling-reorder zone, show an
+                            // insertion line instead of the move-into highlight.
+                            if let Some(insertion) = this.drag_reorder_insertion(
+                                event.drag(cx),
+                                worktree_id,
+                                entry_id,
+                                kind.is_dir(),
+                                event.bounds,
+                                event.event.position,
+                                cx,
+                            ) {
+                                if this.drag_insertion != Some(insertion) {
+                                    this.drag_insertion = Some(insertion);
+                                    this.drag_target_entry = None;
+                                    cx.notify();
+                                }
+                                return;
+                            }
+                            if this.drag_insertion.take().is_some() {
+                                cx.notify();
                             }
 
                             if is_current_target {
@@ -5744,6 +5909,11 @@ impl ProjectPanel {
                             this.hover_scroll_task.take();
                             this.hover_expand_task.take();
                             if folded_directory_drag_target.is_some() {
+                                return;
+                            }
+                            if let Some(insertion) = this.drag_insertion.take() {
+                                this.reorder_via_drag(selections, insertion, window, cx);
+                                cx.stop_propagation();
                                 return;
                             }
                             this.drag_onto(selections, entry_id, kind.is_file(), window, cx);
