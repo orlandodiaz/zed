@@ -3119,6 +3119,41 @@ impl GitPanel {
                 }
             };
 
+            // Confirm before pushing, IntelliJ-style.
+            let ahead = branch
+                .upstream
+                .as_ref()
+                .and_then(|upstream| upstream.tracking.status())
+                .map(|status| status.ahead);
+            let detail = match ahead {
+                Some(count) => format!(
+                    "Push {} commit{} to {}?",
+                    count,
+                    if count == 1 { "" } else { "s" },
+                    remote.name
+                ),
+                None => format!(
+                    "Push branch \"{}\" to {} and set upstream?",
+                    branch.name(),
+                    remote.name
+                ),
+            };
+            let workspace = this.read_with(cx, |this, _| this.workspace.clone())?;
+            let confirmed = cx
+                .update(|window, cx| {
+                    picker_prompt::prompt(
+                        &detail,
+                        vec!["Push".into(), "Cancel".into()],
+                        workspace,
+                        window,
+                        cx,
+                    )
+                })?
+                .await;
+            if confirmed != Some(0) {
+                return Ok(());
+            }
+
             let askpass_delegate = this.update_in(cx, |this, window, cx| {
                 this.askpass_delegate(format!("git push {}", remote.name), window, cx)
             })?;
