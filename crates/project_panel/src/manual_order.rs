@@ -105,3 +105,85 @@ impl ManualOrder {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rank_unlisted_is_none() {
+        let order = ManualOrder::default();
+        assert_eq!(order.rank("", "a"), None);
+    }
+
+    #[test]
+    fn test_is_empty() {
+        let mut order = ManualOrder::default();
+        assert!(order.is_empty());
+        assert!(order.move_within("", "a", 1, &["a", "b"]));
+        assert!(!order.is_empty());
+    }
+
+    #[test]
+    fn test_move_within_materializes_then_swaps() {
+        let mut order = ManualOrder::default();
+        // The first move materializes the display order, then moves "b" up.
+        assert!(order.move_within("", "b", -1, &["a", "b", "c"]));
+        assert_eq!(order.rank("", "b"), Some(0));
+        assert_eq!(order.rank("", "a"), Some(1));
+        assert_eq!(order.rank("", "c"), Some(2));
+    }
+
+    #[test]
+    fn test_move_within_down() {
+        let mut order = ManualOrder::default();
+        assert!(order.move_within("", "a", 1, &["a", "b", "c"]));
+        assert_eq!(order.rank("", "a"), Some(1));
+        assert_eq!(order.rank("", "b"), Some(0));
+    }
+
+    #[test]
+    fn test_move_within_out_of_bounds_is_noop() {
+        let mut order = ManualOrder::default();
+        // "a" is already first; moving it up changes nothing.
+        assert!(!order.move_within("", "a", -1, &["a", "b", "c"]));
+    }
+
+    #[test]
+    fn test_reconcile_adds_new_and_drops_missing() {
+        let mut order = ManualOrder::default();
+        assert!(order.move_within("", "b", -1, &["a", "b", "c"])); // ["b", "a", "c"]
+        // "c" is gone and "d" is new; the next move reconciles both.
+        assert!(order.move_within("", "d", -1, &["b", "a", "d"]));
+        assert_eq!(order.rank("", "c"), None);
+        assert!(order.rank("", "d").is_some());
+    }
+
+    #[test]
+    fn test_reorder_before_and_after() {
+        let mut order = ManualOrder::default();
+        assert!(order.reorder("", "c", "a", true, &["a", "b", "c"]));
+        assert_eq!(order.rank("", "c"), Some(0));
+        assert_eq!(order.rank("", "a"), Some(1));
+        assert_eq!(order.rank("", "b"), Some(2));
+
+        assert!(order.reorder("", "c", "b", false, &["a", "b", "c"]));
+        assert_eq!(order.rank("", "b"), Some(1));
+        assert_eq!(order.rank("", "c"), Some(2));
+    }
+
+    #[test]
+    fn test_reorder_onto_self_is_noop() {
+        let mut order = ManualOrder::default();
+        assert!(!order.reorder("", "a", "a", true, &["a", "b", "c"]));
+    }
+
+    #[test]
+    fn test_json_round_trip() {
+        let mut order = ManualOrder::default();
+        assert!(order.move_within("", "b", -1, &["a", "b", "c"]));
+        let restored = ManualOrder::from_json(&order.to_json());
+        assert_eq!(restored, order);
+        assert_eq!(restored.rank("", "b"), Some(0));
+    }
+}
