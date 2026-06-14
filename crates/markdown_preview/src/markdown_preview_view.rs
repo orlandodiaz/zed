@@ -32,6 +32,7 @@ use workspace::{OpenOptions, OpenVisible, Pane, Workspace};
 
 use crate::{
     OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide, ScrollDown, ScrollDownByItem,
+    ToggleEditPreview,
 };
 use crate::{ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ScrollUp, ScrollUpByItem};
 
@@ -77,6 +78,44 @@ impl MarkdownPreviewView {
                     } else {
                         pane.add_item(Box::new(view.clone()), true, true, None, window, cx)
                     }
+                });
+                cx.notify();
+            }
+        });
+
+        workspace.register_action(move |workspace, _: &ToggleEditPreview, window, cx| {
+            // Rendered preview -> source editor, replacing the item in the same
+            // tab. Checked first: when a preview is active, the active item can
+            // still `act_as` an editor (its backing editor), so the
+            // editor->preview branch below would otherwise spawn a new tab.
+            if let Some(preview) = workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<MarkdownPreviewView>())
+            {
+                if let Some(editor) = preview
+                    .read(cx)
+                    .active_editor
+                    .as_ref()
+                    .map(|state| state.editor.clone())
+                {
+                    let pane = workspace.active_pane().clone();
+                    pane.update(cx, |pane, cx| {
+                        let index = pane.active_item_index();
+                        pane.remove_item(preview.entity_id(), false, false, window, cx);
+                        pane.add_item(Box::new(editor), true, true, Some(index), window, cx);
+                    });
+                    cx.notify();
+                }
+                return;
+            }
+            // Editor -> rendered preview, replacing the item in the same tab.
+            if let Some(editor) = Self::resolve_active_item_as_markdown_editor(workspace, cx) {
+                let view = Self::create_markdown_view(workspace, editor.clone(), window, cx);
+                let pane = workspace.active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    let index = pane.active_item_index();
+                    pane.remove_item(editor.entity_id(), false, false, window, cx);
+                    pane.add_item(Box::new(view), true, true, Some(index), window, cx);
                 });
                 cx.notify();
             }

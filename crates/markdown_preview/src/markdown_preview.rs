@@ -27,7 +27,10 @@ actions!(
         /// Scrolls to the bottom of the markdown preview.
         ScrollToBottom,
         /// Opens a following markdown preview that syncs with the editor.
-        OpenFollowingPreview
+        OpenFollowingPreview,
+        /// Toggles the current markdown tab between the rendered preview and the
+        /// source editor, in place (no separate tab).
+        ToggleEditPreview
     ]
 );
 
