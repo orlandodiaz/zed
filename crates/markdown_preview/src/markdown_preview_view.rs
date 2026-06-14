@@ -1,7 +1,10 @@
 use std::any::TypeId;
+use std::cell::RefCell;
 use std::cmp::min;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +24,7 @@ use markdown::{
 use project::search::SearchQuery;
 use settings::Settings;
 use theme_settings::ThemeSettings;
-use ui::{ContextMenu, Tooltip, WithScrollbar, prelude::*, right_click_menu, utils::WithRemSize};
+use ui::{ContextMenu, Tooltip, prelude::*, right_click_menu, utils::WithRemSize};
 use util::markdown::split_local_url_fragment;
 use util::normalize_path;
 use workspace::item::{Item, ItemBufferKind, ItemHandle};
@@ -66,7 +69,58 @@ struct EditorState {
 }
 
 impl MarkdownPreviewView {
-    pub fn register(workspace: &mut Workspace, _window: &mut Window, _cx: &mut Context<Workspace>) {
+    pub fn register(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+        // Editors that should NOT be auto-converted to a preview the next time
+        // they're added to a pane. Populated when toggling a preview back to its
+        // source editor, so the open-as-preview hook leaves the editor alone.
+        let suppress_auto_preview: Rc<RefCell<HashSet<EntityId>>> =
+            Rc::new(RefCell::new(HashSet::new()));
+
+        // Open markdown files directly in rendered preview. We can't build a
+        // preview from the file-open pipeline (it always builds an Editor for a
+        // buffer), so instead we swap the freshly-added editor for a preview
+        // synchronously, before the frame is painted, so the editor never shows.
+        let workspace_entity = cx.entity();
+        cx.subscribe_in(&workspace_entity, window, {
+            let suppress_auto_preview = suppress_auto_preview.clone();
+            move |workspace, _, event, window, cx| {
+                let workspace::Event::ItemAdded { item } = event else {
+                    return;
+                };
+                let Some(editor) = item.downcast::<Editor>() else {
+                    return;
+                };
+                if !Self::is_markdown_file(&editor, cx) {
+                    return;
+                }
+                if suppress_auto_preview
+                    .borrow_mut()
+                    .remove(&editor.entity_id())
+                {
+                    // This add came from toggling a preview back to its editor.
+                    return;
+                }
+                let Some(pane) = workspace
+                    .panes()
+                    .iter()
+                    .find(|pane| pane.read(cx).index_for_item(&editor).is_some())
+                    .cloned()
+                else {
+                    return;
+                };
+                let view = Self::create_markdown_view(workspace, editor.clone(), window, cx);
+                pane.update(cx, |pane, cx| {
+                    let Some(index) = pane.index_for_item(&editor) else {
+                        return;
+                    };
+                    pane.remove_item(editor.entity_id(), false, false, window, cx);
+                    pane.add_item(Box::new(view), true, true, Some(index), window, cx);
+                });
+                cx.notify();
+            }
+        })
+        .detach();
+
         workspace.register_action(move |workspace, _: &OpenPreview, window, cx| {
             if let Some(editor) = Self::resolve_active_item_as_markdown_editor(workspace, cx) {
                 let view = Self::create_markdown_view(workspace, editor.clone(), window, cx);
@@ -83,6 +137,7 @@ impl MarkdownPreviewView {
             }
         });
 
+        let suppress_for_toggle = suppress_auto_preview.clone();
         workspace.register_action(move |workspace, _: &ToggleEditPreview, window, cx| {
             // Rendered preview -> source editor, replacing the item in the same
             // tab. Checked first: when a preview is active, the active item can
@@ -98,6 +153,9 @@ impl MarkdownPreviewView {
                     .as_ref()
                     .map(|state| state.editor.clone())
                 {
+                    // The editor is about to be re-added to its pane; don't let
+                    // the open-as-preview hook immediately convert it back.
+                    suppress_for_toggle.borrow_mut().insert(editor.entity_id());
                     let pane = workspace.active_pane().clone();
                     pane.update(cx, |pane, cx| {
                         let index = pane.active_item_index();
@@ -988,7 +1046,6 @@ impl Render for MarkdownPreviewView {
                         }),
                 ),
             )
-            .vertical_scrollbar_for(&self.scroll_handle, window, cx)
     }
 }
 
