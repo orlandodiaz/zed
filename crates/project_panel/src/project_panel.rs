@@ -6539,7 +6539,7 @@ impl ProjectPanel {
             .copied();
 
         let filename_text_color =
-            entry_git_aware_label_color(git_status, entry.is_ignored, is_marked);
+            entry_git_label_color(entry.is_dir(), git_status, entry.is_ignored, is_marked);
 
         let is_cut = self
             .clipboard
@@ -7733,6 +7733,19 @@ fn git_status_indicator(git_status: GitSummary) -> Option<(&'static str, Color)>
         return Some(("A", Color::Created));
     }
     None
+}
+
+/// Color for an entry's filename label. Directories are deliberately *not*
+/// tinted by the aggregated git status of their contents; only individual files
+/// take on their git status color, so a folder doesn't go red/yellow just
+/// because something inside it changed.
+fn entry_git_label_color(is_dir: bool, git_status: GitSummary, ignored: bool, marked: bool) -> Color {
+    let git_status = if is_dir {
+        GitSummary::default()
+    } else {
+        git_status
+    };
+    entry_git_aware_label_color(git_status, ignored, marked)
 }
 
 #[cfg(test)]

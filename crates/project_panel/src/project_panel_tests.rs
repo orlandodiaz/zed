@@ -10368,3 +10368,32 @@ impl Render for TestProjectItemView {
         Empty
     }
 }
+
+#[test]
+fn directories_are_not_colored_by_child_git_status() {
+    use git::status::{GitSummary, TrackedSummary};
+
+    let modified = GitSummary {
+        worktree: TrackedSummary {
+            modified: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // A modified file takes on the git "modified" color.
+    assert_eq!(
+        entry_git_label_color(false, modified, false, false),
+        Color::Modified,
+    );
+    // A directory whose contents are modified is NOT tinted by that status...
+    assert_ne!(
+        entry_git_label_color(true, modified, false, false),
+        Color::Modified,
+    );
+    // ...it uses the same color as a directory with no changes inside.
+    assert_eq!(
+        entry_git_label_color(true, modified, false, false),
+        entry_git_label_color(true, GitSummary::default(), false, false),
+    );
+}
