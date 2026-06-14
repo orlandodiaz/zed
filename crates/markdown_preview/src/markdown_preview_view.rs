@@ -9,7 +9,7 @@ use anyhow::Result;
 use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
 use gpui::{
-    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
+    App, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, ImageSource,
     InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource, RetainAllImageCache,
     ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point,
 };
@@ -21,7 +21,7 @@ use markdown::{
 use project::search::SearchQuery;
 use settings::Settings;
 use theme_settings::ThemeSettings;
-use ui::{ContextMenu, WithScrollbar, prelude::*, right_click_menu, utils::WithRemSize};
+use ui::{ContextMenu, Tooltip, WithScrollbar, prelude::*, right_click_menu, utils::WithRemSize};
 use util::markdown::split_local_url_fragment;
 use util::normalize_path;
 use workspace::item::{Item, ItemBufferKind, ItemHandle};
@@ -881,19 +881,32 @@ impl Item for MarkdownPreviewView {
         }
     }
 
-    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
-        Some(Icon::new(IconName::FileDoc))
-    }
-
-    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+    fn tab_icon(&self, window: &Window, cx: &App) -> Option<Icon> {
+        // Match the source editor's tab icon so the tab is unchanged on toggle.
         self.active_editor
             .as_ref()
-            .map(|editor_state| {
-                let buffer = editor_state.editor.read(cx).buffer().read(cx);
-                let title = buffer.title(cx);
-                format!("Preview {}", title).into()
-            })
+            .and_then(|state| state.editor.read(cx).tab_icon(window, cx))
+            .or_else(|| Some(Icon::new(IconName::FileDoc)))
+    }
+
+    fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {
+        // Match the source editor's tab title (no "Preview" prefix).
+        self.active_editor
+            .as_ref()
+            .map(|state| state.editor.read(cx).tab_content_text(detail, cx))
             .unwrap_or_else(|| SharedString::from("Markdown Preview"))
+    }
+
+    fn for_each_project_item(
+        &self,
+        cx: &App,
+        f: &mut dyn FnMut(EntityId, &dyn project::ProjectItem),
+    ) {
+        // Report the underlying file so the project panel keeps it selected and
+        // breadcrumbs/active-file features work while previewing.
+        if let Some(state) = self.active_editor.as_ref() {
+            state.editor.read(cx).for_each_project_item(cx, f);
+        }
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
@@ -934,6 +947,7 @@ impl Render for MarkdownPreviewView {
             .on_action(cx.listener(MarkdownPreviewView::scroll_to_top))
             .on_action(cx.listener(MarkdownPreviewView::scroll_to_bottom))
             .size_full()
+            .relative()
             .bg(cx.theme().colors().editor_background)
             .child(
                 div()
@@ -963,6 +977,16 @@ impl Render for MarkdownPreviewView {
                                 })
                             })
                     })),
+            )
+            .child(
+                div().absolute().top_2().right_4().child(
+                    IconButton::new("markdown-toggle-edit", IconName::Pencil)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Edit Markdown"))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(ToggleEditPreview), cx);
+                        }),
+                ),
             )
             .vertical_scrollbar_for(&self.scroll_handle, window, cx)
     }

@@ -5,7 +5,7 @@ use csv_preview::{
 use feature_flags::FeatureFlagAppExt as _;
 use gpui::{AnyElement, Modifiers, WeakEntity};
 use markdown_preview::{
-    OpenPreview as MarkdownOpenPreview, OpenPreviewToTheSide as MarkdownOpenPreviewToTheSide,
+    OpenPreviewToTheSide as MarkdownOpenPreviewToTheSide, ToggleEditPreview as MarkdownToggleEditPreview,
     markdown_preview_view::MarkdownPreviewView,
 };
 use svg_preview::{
@@ -56,9 +56,9 @@ impl QuickActionBar {
                 PreviewType::Markdown => (
                     "toggle-markdown-preview",
                     "Preview Markdown",
-                    Box::new(MarkdownOpenPreview) as Box<dyn gpui::Action>,
+                    Box::new(MarkdownToggleEditPreview) as Box<dyn gpui::Action>,
                     Box::new(MarkdownOpenPreviewToTheSide) as Box<dyn gpui::Action>,
-                    &markdown_preview::OpenPreview as &dyn gpui::Action,
+                    &MarkdownToggleEditPreview as &dyn gpui::Action,
                 ),
                 PreviewType::Svg => (
                     "toggle-svg-preview",
