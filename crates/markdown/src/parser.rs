@@ -20,7 +20,8 @@ pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_OLD_FOOTNOTES)
     .union(Options::ENABLE_GFM)
     .union(Options::ENABLE_SUPERSCRIPT)
-    .union(Options::ENABLE_SUBSCRIPT);
+    .union(Options::ENABLE_SUBSCRIPT)
+    .union(Options::ENABLE_WIKILINKS);
 
 #[derive(Default)]
 struct ParseState {
@@ -785,8 +786,7 @@ mod tests {
 
     const UNWANTED_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
         .union(Options::ENABLE_MATH)
-        .union(Options::ENABLE_DEFINITION_LIST)
-        .union(Options::ENABLE_WIKILINKS);
+        .union(Options::ENABLE_DEFINITION_LIST);
 
     #[test]
     fn all_options_considered() {
@@ -802,7 +802,6 @@ mod tests {
             Options::empty()
         );
     }
-
     #[test]
     fn test_html_comments() {
         assert_eq!(

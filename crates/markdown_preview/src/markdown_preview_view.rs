@@ -1,4 +1,4 @@
-use std::any::TypeId;
+use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::HashSet;
@@ -15,7 +15,7 @@ use gpui::{
     App, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight,
     ImageSource,
     InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource, RetainAllImageCache,
-    ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point,
+    ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point, px,
 };
 use language::LanguageRegistry;
 use markdown::{
@@ -32,7 +32,7 @@ use workspace::item::{Item, ItemBufferKind, ItemHandle};
 use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
 };
-use workspace::{OpenOptions, OpenVisible, Pane, Workspace};
+use workspace::{ItemNavHistory, OpenOptions, OpenVisible, Pane, Workspace};
 
 use crate::{
     OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide, ScrollDown, ScrollDownByItem,
@@ -704,10 +704,9 @@ impl MarkdownPreviewView {
             }
         }
 
-        let mut markdown_element = MarkdownElement::new(
-            self.markdown.clone(),
-            MarkdownStyle::themed(MarkdownFont::Editor, window, cx),
-        )
+        let mut markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
+        markdown_style.base_text_style.font_size = px(14.0).into();
+        let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
         .code_block_renderer(CodeBlockRenderer::Default {
             copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
             border: false,
@@ -851,7 +850,61 @@ fn open_preview_url(
         return;
     }
 
-    cx.open_url(url.as_ref());
+    // Obsidian-style wikilink: resolve `[[Name]]` to `Name.md` anywhere in the
+    // project and open it.
+    if let Some(workspace) = workspace.upgrade()
+        && open_wikilink_target(url.as_ref(), &workspace, window, cx)
+    {
+        return;
+    }
+
+    // Only hand off to the OS for real URLs. A bare, unresolved wikilink
+    // otherwise triggers a macOS "application can't be opened (-50)" error.
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+        cx.open_url(url.as_ref());
+    }
+}
+
+/// Resolve an Obsidian-style wikilink target (the text inside `[[ ]]`) to a
+/// markdown file with that name anywhere in the project's worktrees and open
+/// it. Returns false if no matching file is found.
+fn open_wikilink_target(
+    name: &str,
+    workspace: &Entity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let name = urlencoding::decode(name)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| name.to_string());
+    let file_name = if name.ends_with(".md") {
+        name.clone()
+    } else {
+        format!("{name}.md")
+    };
+    let project_path = {
+        let project = workspace.read(cx).project().read(cx);
+        project.worktrees(cx).find_map(|worktree| {
+            let worktree = worktree.read(cx);
+            let worktree_id = worktree.id();
+            // include_ignored: wiki notes are often gitignored, so search them too.
+            worktree.files(true, 0).find_map(|entry| {
+                (entry.path.file_name() == Some(file_name.as_str())).then(|| project::ProjectPath {
+                    worktree_id,
+                    path: entry.path.clone(),
+                })
+            })
+        })
+    };
+    let Some(project_path) = project_path else {
+        return false;
+    };
+    workspace.update(cx, |workspace, cx| {
+        workspace
+            .open_path(project_path, None, true, window, cx)
+            .detach();
+    });
+    true
 }
 
 fn resolve_preview_path(url: &str, base_directory: Option<&Path>) -> Option<PathBuf> {
@@ -975,6 +1028,46 @@ impl Item for MarkdownPreviewView {
         if let Some(state) = self.active_editor.as_ref() {
             state.editor.read(cx).for_each_project_item(cx, f);
         }
+    }
+
+    // Delegate nav-history hooks to the backing editor so back/forward records
+    // and restores this previewed file. Without this, previews leave no history
+    // entries and Back skips over them to the last plain editor.
+    fn set_nav_history(
+        &mut self,
+        history: ItemNavHistory,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.active_editor.as_ref() {
+            state
+                .editor
+                .update(cx, |editor, _| editor.set_nav_history(Some(history)));
+        }
+    }
+
+    fn deactivated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.active_editor.as_ref() {
+            state
+                .editor
+                .update(cx, |editor, cx| editor.deactivated(window, cx));
+        }
+    }
+
+    fn navigate(
+        &mut self,
+        data: Arc<dyn Any + Send>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.active_editor
+            .as_ref()
+            .map(|state| {
+                state
+                    .editor
+                    .update(cx, |editor, cx| editor.navigate(data, window, cx))
+            })
+            .unwrap_or(false)
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
