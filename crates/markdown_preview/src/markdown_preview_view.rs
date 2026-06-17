@@ -907,8 +907,11 @@ fn open_wikilink_target(
         return false;
     };
     workspace.update(cx, |workspace, cx| {
+        // allow_preview = true so the target opens in the reused preview tab
+        // (and the open-as-preview swap keeps that status) instead of piling
+        // up a new permanent tab per wikilink click.
         workspace
-            .open_path(project_path, None, true, window, cx)
+            .open_path_preview(project_path, None, true, true, true, window, cx)
             .detach();
     });
     true
