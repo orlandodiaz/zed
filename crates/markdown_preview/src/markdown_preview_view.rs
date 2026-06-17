@@ -712,8 +712,7 @@ impl MarkdownPreviewView {
             }
         }
 
-        let mut markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
-        markdown_style.base_text_style.font_size = px(14.0).into();
+        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
         let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
         .code_block_renderer(CodeBlockRenderer::Default {
             copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
@@ -1125,6 +1124,9 @@ impl Render for MarkdownPreviewView {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
                     .p_4()
+                    // Body text inherits this size (gpui text runs don't carry a
+                    // size); headings set their own size so they're unaffected.
+                    .text_size(px(15.0))
                     .children(self.document_title(cx).map(|title| {
                         div()
                             .pb_3()
