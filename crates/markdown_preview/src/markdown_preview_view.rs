@@ -12,7 +12,8 @@ use anyhow::Result;
 use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
 use gpui::{
-    App, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, ImageSource,
+    App, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight,
+    ImageSource,
     InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource, RetainAllImageCache,
     ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point,
 };
@@ -556,6 +557,16 @@ impl MarkdownPreviewView {
         }
     }
 
+    /// The document title shown at the top of the preview: the file name without
+    /// its extension (e.g. `EDW Team.md` -> "EDW Team"), Obsidian-style.
+    fn document_title(&self, cx: &App) -> Option<SharedString> {
+        let editor = self.active_editor.as_ref()?.editor.read(cx);
+        let file = editor.file_at(MultiBufferOffset(0), cx)?;
+        let abs_path = file.as_local()?.abs_path(cx);
+        let stem = abs_path.file_stem()?.to_string_lossy().into_owned();
+        Some(stem.into())
+    }
+
     fn line_scroll_amount(&self, cx: &App) -> Pixels {
         let settings = ThemeSettings::get_global(cx);
         settings.buffer_font_size(cx) * settings.buffer_line_height.value()
@@ -702,7 +713,6 @@ impl MarkdownPreviewView {
             border: false,
         })
         .scroll_handle(self.scroll_handle.clone())
-        .show_root_block_markers()
         .image_resolver({
             let base_directory = self.base_directory.clone();
             move |dest_url| {
@@ -1014,6 +1024,13 @@ impl Render for MarkdownPreviewView {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
                     .p_4()
+                    .children(self.document_title(cx).map(|title| {
+                        div()
+                            .pb_3()
+                            .text_2xl()
+                            .font_weight(FontWeight::BOLD)
+                            .child(title)
+                    }))
                     .child(WithRemSize::new(rem_size).child({
                         let markdown_element = self.render_markdown_element(window, cx);
                         let markdown = self.markdown.clone();
