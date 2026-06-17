@@ -110,12 +110,20 @@ impl MarkdownPreviewView {
                     return;
                 };
                 let view = Self::create_markdown_view(workspace, editor.clone(), window, cx);
+                let view_id = view.entity_id();
                 pane.update(cx, |pane, cx| {
                     let Some(index) = pane.index_for_item(&editor) else {
                         return;
                     };
+                    // Preserve preview-tab (single-click) behavior: if the editor
+                    // was the pane's preview item, make the swapped-in preview the
+                    // preview item too, so markdown clicks reuse one tab.
+                    let was_preview = pane.preview_item_id() == Some(editor.entity_id());
                     pane.remove_item(editor.entity_id(), false, false, window, cx);
                     pane.add_item(Box::new(view), true, true, Some(index), window, cx);
+                    if was_preview {
+                        pane.replace_preview_item_id(view_id, window, cx);
+                    }
                 });
                 cx.notify();
             }
