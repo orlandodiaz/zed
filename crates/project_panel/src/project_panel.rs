@@ -748,9 +748,21 @@ impl ProjectPanel {
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
                     }
-                    project::Event::WorktreeUpdatedEntries(_, _)
-                    | project::Event::WorktreeAdded(_)
+                    project::Event::WorktreeUpdatedEntries(_, changes) => {
+                        // Reload manual ordering when a `.order` file appears or
+                        // changes (e.g. edited by an external tool or an agent),
+                        // so the panel reflects it without a restart.
+                        if changes.iter().any(|(path, _, _)| {
+                            path.file_name() == Some(manual_order::ORDER_FILE_NAME)
+                        }) {
+                            this.load_manual_orders(window, cx);
+                        }
+                        this.update_visible_entries(None, false, false, window, cx);
+                        cx.notify();
+                    }
+                    project::Event::WorktreeAdded(_)
                     | project::Event::WorktreeOrderChanged => {
+                        this.load_manual_orders(window, cx);
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
                     }
@@ -3963,27 +3975,48 @@ impl ProjectPanel {
 
     fn load_manual_orders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fs = self.fs.clone();
-        let worktrees: Vec<(WorktreeId, Arc<Path>)> = self
+        // Collect every `.order` file's (worktree-relative dir, absolute path)
+        // from the worktree snapshots (include ignored so a gitignored `.order`
+        // is still honored), then read their contents off the foreground thread.
+        let worktrees: Vec<(WorktreeId, Vec<(String, PathBuf)>)> = self
             .project
             .read(cx)
             .visible_worktrees(cx)
             .map(|worktree| {
                 let worktree = worktree.read(cx);
-                (worktree.id(), worktree.abs_path())
+                let order_files = worktree
+                    .entries(true, 0)
+                    .filter(|entry| {
+                        entry.is_file()
+                            && entry.path.file_name() == Some(manual_order::ORDER_FILE_NAME)
+                    })
+                    .map(|entry| {
+                        let dir = entry
+                            .path
+                            .parent()
+                            .map(|parent| parent.as_unix_str().to_string())
+                            .unwrap_or_default();
+                        (dir, worktree.absolutize(&entry.path))
+                    })
+                    .collect();
+                (worktree.id(), order_files)
             })
             .collect();
         cx.spawn_in(window, async move |this, cx| {
             let mut orders: HashMap<WorktreeId, manual_order::ManualOrder> = HashMap::default();
-            for (worktree_id, abs_path) in worktrees {
-                let path = abs_path.join(manual_order::MANUAL_ORDER_REL_PATH);
-                if let Ok(text) = fs.load(&path).await {
-                    orders.insert(worktree_id, manual_order::ManualOrder::from_json(&text));
+            for (worktree_id, order_files) in worktrees {
+                let mut order = manual_order::ManualOrder::default();
+                for (dir, path) in order_files {
+                    if let Ok(text) = fs.load(&path).await {
+                        order.set_dir(&dir, manual_order::ManualOrder::parse_lines(&text));
+                    }
+                }
+                if !order.is_empty() {
+                    orders.insert(worktree_id, order);
                 }
             }
-            if orders.is_empty() {
-                return;
-            }
             this.update_in(cx, |this, window, cx| {
+                // Always assign (even if empty) so deleting a `.order` clears it.
                 this.manual_orders = orders;
                 this.update_visible_entries(None, false, false, window, cx);
             })
@@ -4014,7 +4047,7 @@ impl ProjectPanel {
         if !order.move_within(&parent, &name, delta, &siblings) {
             return;
         }
-        self.persist_manual_order(worktree_id, abs_path, cx);
+        self.persist_manual_order(worktree_id, abs_path, &parent, cx);
         self.update_visible_entries(None, false, false, window, cx);
     }
 
@@ -4060,19 +4093,26 @@ impl ProjectPanel {
         &self,
         worktree_id: WorktreeId,
         abs_path: Arc<Path>,
+        dir: &str,
         cx: &mut Context<Self>,
     ) {
         let Some(order) = self.manual_orders.get(&worktree_id) else {
             return;
         };
-        let json = order.to_json();
+        let lines = order.dir_lines(dir);
+        if lines.is_empty() {
+            return;
+        }
         let fs = self.fs.clone();
-        let path = abs_path.join(manual_order::MANUAL_ORDER_REL_PATH);
+        // The directory always exists (it's a real worktree folder), so no
+        // need to create it — just write `<dir>/.order`.
+        let mut path = abs_path.to_path_buf();
+        if !dir.is_empty() {
+            path.push(dir);
+        }
+        path.push(manual_order::ORDER_FILE_NAME);
         cx.background_spawn(async move {
-            if let Some(dir) = path.parent() {
-                fs.create_dir(dir).await.ok();
-            }
-            fs.atomic_write(path, json).await.ok();
+            fs.atomic_write(path, lines).await.ok();
         })
         .detach();
     }
@@ -4162,7 +4202,7 @@ impl ProjectPanel {
         if !order.reorder(&parent, &name, &anchor_name, insertion.before, &siblings) {
             return;
         }
-        self.persist_manual_order(worktree_id, abs_path, cx);
+        self.persist_manual_order(worktree_id, abs_path, &parent, cx);
         self.update_visible_entries(None, false, false, window, cx);
     }
 
@@ -4298,6 +4338,8 @@ impl ProjectPanel {
                             auto_folded_ancestors.clear();
                             if (!hide_gitignore || !entry.is_ignored)
                                 && (!hide_hidden || !entry.is_hidden)
+                                // `.order` files hold the panel's manual ordering; never show them.
+                                && entry.path.file_name() != Some(manual_order::ORDER_FILE_NAME)
                             {
                                 visible_worktree_entries.push(entry.to_owned());
                             }

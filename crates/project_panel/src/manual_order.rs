@@ -1,29 +1,48 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-
-/// Worktree-relative path to the file that stores a worktree's manual ordering.
-pub const MANUAL_ORDER_REL_PATH: &str = ".zed/panel-order.json";
+/// File name, placed in each directory, that stores that directory's manual
+/// child ordering — one entry name per line.
+pub const ORDER_FILE_NAME: &str = ".order";
 
 /// Per-directory manual ordering for the project panel.
 ///
-/// Persisted to `<worktree-root>/.zed/panel-order.json`. Keys are
-/// worktree-relative directory paths (`""` is the worktree root); values are
-/// the ordered child names for that directory. Children that are not listed
-/// fall back to the configured automatic sort, placed after the listed ones.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+/// Persisted as a plain-text `.order` file inside each directory (one child
+/// name per line). Keys here are worktree-relative directory paths (`""` is the
+/// worktree root); values are the ordered child names for that directory.
+/// Children that are not listed fall back to the configured automatic sort,
+/// placed after the listed ones.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ManualOrder {
     dirs: HashMap<String, Vec<String>>,
 }
 
 impl ManualOrder {
-    pub fn from_json(text: &str) -> Self {
-        serde_json::from_str(text).unwrap_or_default()
+    /// Parse a `.order` file's contents into child names: one per line,
+    /// trimmed, with blank lines ignored.
+    pub fn parse_lines(text: &str) -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
-    pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    /// Replace `dir`'s ordering with `names` (an empty list clears it).
+    pub fn set_dir(&mut self, dir: &str, names: Vec<String>) {
+        if names.is_empty() {
+            self.dirs.remove(dir);
+        } else {
+            self.dirs.insert(dir.to_string(), names);
+        }
+    }
+
+    /// `dir`'s ordering serialized for its `.order` file (one name per line),
+    /// or an empty string if the directory has no manual ordering.
+    pub fn dir_lines(&self, dir: &str) -> String {
+        self.dirs
+            .get(dir)
+            .map(|names| names.join("\n"))
+            .unwrap_or_default()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -179,11 +198,20 @@ mod tests {
     }
 
     #[test]
-    fn test_json_round_trip() {
+    fn test_lines_round_trip() {
         let mut order = ManualOrder::default();
         assert!(order.move_within("", "b", -1, &["a", "b", "c"]));
-        let restored = ManualOrder::from_json(&order.to_json());
-        assert_eq!(restored, order);
+        let lines = order.dir_lines("");
+
+        let mut restored = ManualOrder::default();
+        restored.set_dir("", ManualOrder::parse_lines(&lines));
         assert_eq!(restored.rank("", "b"), Some(0));
+        assert_eq!(restored.rank("", "a"), Some(1));
+        assert_eq!(restored.rank("", "c"), Some(2));
+        // Blank lines and surrounding whitespace are ignored.
+        let mut padded = ManualOrder::default();
+        padded.set_dir("", ManualOrder::parse_lines("\n a \n\n b \n"));
+        assert_eq!(padded.rank("", "a"), Some(0));
+        assert_eq!(padded.rank("", "b"), Some(1));
     }
 }
