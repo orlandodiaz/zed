@@ -1190,7 +1190,7 @@ impl Render for MarkdownPreviewView {
                     .children(self.document_title(cx).map(|title| {
                         div()
                             .pb_3()
-                            .text_2xl()
+                            .text_3xl()
                             .font_weight(FontWeight::BOLD)
                             .child(title)
                     }))
