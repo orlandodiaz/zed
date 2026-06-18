@@ -1156,7 +1156,7 @@ impl MarkdownElement {
         builder.push_div(
             div()
                 .when(!self.style.height_is_multiple_of_line_height, |el| {
-                    el.mb_1().gap_1().line_height(rems(1.5))
+                    el.mb_1().gap_2().line_height(rems(1.5))
                 })
                 .h_flex()
                 .items_start()
@@ -1826,7 +1826,16 @@ impl Element for MarkdownElement {
                                 } else if let Some(bullet_index) = builder.next_bullet_index() {
                                     div().child(format!("{}.", bullet_index)).into_any_element()
                                 } else {
-                                    div().child("•").into_any_element()
+                                    // Vary the marker by nesting depth, like
+                                    // Notion: solid dot, hollow circle, square.
+                                    match builder.list_stack.len().saturating_sub(1) % 3 {
+                                        1 => div().child("◦").into_any_element(),
+                                        2 => div().child("▪").into_any_element(),
+                                        _ => div()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child("•")
+                                            .into_any_element(),
+                                    }
                                 };
                             self.push_markdown_list_item(&mut builder, bullet, range, markdown_end);
                         }
