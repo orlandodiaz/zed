@@ -1,4 +1,5 @@
 pub mod html;
+mod math;
 mod mermaid;
 pub mod parser;
 mod path_range;
@@ -1065,26 +1066,37 @@ impl MarkdownElement {
         range: &Range<usize>,
         markdown_end: usize,
         text_align_override: Option<TextAlign>,
+        wrap_inline: bool,
     ) {
         let align = text_align_override.unwrap_or(self.style.base_text_style.text_align);
         let mut paragraph = div().when(!self.style.height_is_multiple_of_line_height, |el| {
             el.mb_4().line_height(rems(1.5))
         });
 
-        paragraph = match align {
-            TextAlign::Center => paragraph.text_center(),
-            TextAlign::Left => paragraph.text_left(),
-            TextAlign::Right => paragraph.text_right(),
-        };
+        // Paragraphs containing inline math become a wrapping flex row of
+        // per-word elements (see `push_wrapped_words`), so the equation flows
+        // inline and the line still wraps. Plain paragraphs keep the single
+        // shaped-`StyledText` fast path with full kerning.
+        if wrap_inline {
+            paragraph = paragraph.flex().flex_row().flex_wrap().items_baseline();
+        } else {
+            paragraph = match align {
+                TextAlign::Center => paragraph.text_center(),
+                TextAlign::Left => paragraph.text_left(),
+                TextAlign::Right => paragraph.text_right(),
+            };
+        }
 
         builder.push_text_style(TextStyleRefinement {
             text_align: Some(align),
             ..Default::default()
         });
         builder.push_div(paragraph, range, markdown_end);
+        builder.wrap_words = wrap_inline;
     }
 
     fn pop_markdown_paragraph(&self, builder: &mut MarkdownElementBuilder) {
+        builder.wrap_words = false;
         builder.pop_div();
         builder.pop_text_style();
     }
@@ -1152,6 +1164,7 @@ impl MarkdownElement {
         bullet: AnyElement,
         range: &Range<usize>,
         markdown_end: usize,
+        wrap_inline: bool,
     ) {
         builder.push_div(
             div()
@@ -1165,10 +1178,18 @@ impl MarkdownElement {
             markdown_end,
         );
         // Without `w_0`, text doesn't wrap to the width of the container.
-        builder.push_div(div().flex_1().w_0(), range, markdown_end);
+        let mut content = div().flex_1().w_0();
+        // A tight list item with inline math becomes a wrapping flex row of
+        // per-word boxes so the equation flows inline (see `push_wrapped_words`).
+        if wrap_inline {
+            content = content.flex().flex_row().flex_wrap().items_baseline();
+        }
+        builder.push_div(content, range, markdown_end);
+        builder.wrap_words = wrap_inline;
     }
 
     fn pop_markdown_list_item(&self, builder: &mut MarkdownElementBuilder) {
+        builder.wrap_words = false;
         builder.pop_div();
         builder.pop_div();
     }
@@ -1664,7 +1685,22 @@ impl Element for MarkdownElement {
                             }
                         }
                         MarkdownTag::Paragraph => {
-                            self.push_markdown_paragraph(&mut builder, range, markdown_end, None);
+                            let has_inline_math = parsed_markdown.events[index + 1..]
+                                .iter()
+                                .take_while(|(_, event)| {
+                                    !matches!(
+                                        event,
+                                        MarkdownEvent::End(MarkdownTagEnd::Paragraph)
+                                    )
+                                })
+                                .any(|(_, event)| matches!(event, MarkdownEvent::InlineMath(_)));
+                            self.push_markdown_paragraph(
+                                &mut builder,
+                                range,
+                                markdown_end,
+                                None,
+                                has_inline_math,
+                            );
                         }
                         MarkdownTag::Heading { level, .. } => {
                             self.push_markdown_heading(
@@ -1837,7 +1873,34 @@ impl Element for MarkdownElement {
                                             .into_any_element(),
                                     }
                                 };
-                            self.push_markdown_list_item(&mut builder, bullet, range, markdown_end);
+                            // Detect inline math directly in this item (tight
+                            // list), excluding math nested in a child block like
+                            // a paragraph or sublist (those handle their own
+                            // wrapping). Only direct inline math needs the item's
+                            // content row to become a wrapping flex row.
+                            let mut depth = 0usize;
+                            let mut item_has_inline_math = false;
+                            for (_, event) in &parsed_markdown.events[index + 1..] {
+                                match event {
+                                    MarkdownEvent::InlineMath(_) if depth == 0 => {
+                                        item_has_inline_math = true;
+                                        break;
+                                    }
+                                    MarkdownEvent::Start(_) => depth += 1,
+                                    MarkdownEvent::End(MarkdownTagEnd::Item) if depth == 0 => {
+                                        break;
+                                    }
+                                    MarkdownEvent::End(_) => depth = depth.saturating_sub(1),
+                                    _ => {}
+                                }
+                            }
+                            self.push_markdown_list_item(
+                                &mut builder,
+                                bullet,
+                                range,
+                                markdown_end,
+                                item_has_inline_math,
+                            );
                         }
                         MarkdownTag::Emphasis => builder.push_text_style(TextStyleRefinement {
                             font_style: Some(FontStyle::Italic),
@@ -2118,6 +2181,30 @@ impl Element for MarkdownElement {
                     builder.push_text(&format!("[{label}]"), range.clone());
                     builder.pop_text_style();
                 }
+                MarkdownEvent::DisplayMath(latex) => {
+                    let text_style = builder.text_style();
+                    let em_px = text_style.font_size.to_pixels(window.rem_size());
+                    let color = text_style.color;
+                    if let Some(element) = math::display_math(latex, em_px, color) {
+                        builder.push_sourced_element(range.clone(), element);
+                    } else {
+                        builder.push_text(latex, range.clone());
+                    }
+                }
+                MarkdownEvent::InlineMath(latex) => {
+                    let text_style = builder.text_style();
+                    let em_px = text_style.font_size.to_pixels(window.rem_size());
+                    let color = text_style.color;
+                    if let Some(element) = math::inline_math(latex, em_px, color) {
+                        // In a math paragraph the current div is already a
+                        // `flex_wrap` row (see `push_markdown_paragraph`), so the
+                        // equation just flows in as another box and wraps with
+                        // the surrounding words.
+                        builder.modify_current_div(|el| el.child(element));
+                    } else {
+                        builder.push_text(latex, range.clone());
+                    }
+                }
             }
         }
         if self.style.code_block_overflow_x_scroll {
@@ -2361,6 +2448,9 @@ struct MarkdownElementBuilder {
     rendered_links: Vec<RenderedLink>,
     rendered_footnote_refs: Vec<RenderedFootnoteRef>,
     current_source_index: usize,
+    /// When set, text is emitted as one element per word so the current div
+    /// (a `flex_wrap` row) can wrap between words and around inline math.
+    wrap_words: bool,
     html_comment: bool,
     rendered_footnote_separator: bool,
     base_text_style: TextStyle,
@@ -2399,6 +2489,7 @@ impl MarkdownElementBuilder {
             rendered_links: Vec::new(),
             rendered_footnote_refs: Vec::new(),
             current_source_index: 0,
+            wrap_words: false,
             html_comment: false,
             rendered_footnote_separator: false,
             base_text_style,
@@ -2559,7 +2650,30 @@ impl MarkdownElementBuilder {
         });
     }
 
+    /// Emit `text` as one `StyledText` element per word into the current
+    /// `flex_wrap` div, so it wraps between words and flows around inline math.
+    /// Trailing spaces stay attached to each word to preserve inter-word
+    /// spacing. Word-level boxes lose cross-word shaping and aren't registered
+    /// for selection — used only for paragraphs that contain inline math.
+    fn push_wrapped_words(&mut self, text: &str, source_range: Range<usize>) {
+        self.current_source_index = source_range.end;
+        let style = self.text_style();
+        for word in text.split_inclusive(' ') {
+            if word.is_empty() {
+                continue;
+            }
+            let element = StyledText::new(word.to_string())
+                .with_runs(vec![style.to_run(word.len())])
+                .into_any();
+            self.div_stack.last_mut().unwrap().extend([element]);
+        }
+    }
+
     fn push_text(&mut self, text: &str, source_range: Range<usize>) {
+        if self.wrap_words {
+            self.push_wrapped_words(text, source_range);
+            return;
+        }
         self.pending_line.source_mappings.push(SourceMapping {
             rendered_index: self.pending_line.text.len(),
             source_index: source_range.start,

@@ -21,6 +21,7 @@ pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_GFM)
     .union(Options::ENABLE_SUPERSCRIPT)
     .union(Options::ENABLE_SUBSCRIPT)
+    .union(Options::ENABLE_MATH)
     .union(Options::ENABLE_WIKILINKS);
 
 #[derive(Default)]
@@ -511,7 +512,14 @@ pub(crate) fn parse_markdown_with_options(
             pulldown_cmark::Event::TaskListMarker(checked) => {
                 state.push_event(range, MarkdownEvent::TaskListMarker(checked))
             }
-            pulldown_cmark::Event::InlineMath(_) | pulldown_cmark::Event::DisplayMath(_) => {}
+            pulldown_cmark::Event::InlineMath(content) => state.push_event(
+                range,
+                MarkdownEvent::InlineMath(SharedString::from(content.to_string())),
+            ),
+            pulldown_cmark::Event::DisplayMath(content) => state.push_event(
+                range,
+                MarkdownEvent::DisplayMath(SharedString::from(content.to_string())),
+            ),
         }
     }
 
@@ -621,6 +629,10 @@ pub enum MarkdownEvent {
     /// by an event with a `Tag::FootnoteDefinition` tag. Definitions and references to them may
     /// occur in any order.
     FootnoteReference(SharedString),
+    /// Inline math (`$…$`). Contains the raw LaTeX between the delimiters.
+    InlineMath(SharedString),
+    /// Display math (`$$…$$`). Contains the raw LaTeX between the delimiters.
+    DisplayMath(SharedString),
     /// A soft line break.
     SoftBreak,
     /// A hard line break.
@@ -784,9 +796,8 @@ mod tests {
     use super::MarkdownTag::*;
     use super::*;
 
-    const UNWANTED_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
-        .union(Options::ENABLE_MATH)
-        .union(Options::ENABLE_DEFINITION_LIST);
+    const UNWANTED_OPTIONS: Options =
+        Options::ENABLE_YAML_STYLE_METADATA_BLOCKS.union(Options::ENABLE_DEFINITION_LIST);
 
     #[test]
     fn all_options_considered() {

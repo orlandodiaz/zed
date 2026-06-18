@@ -31,12 +31,17 @@ log.workspace = true
 markup5ever_rcdom.workspace = true
 mermaid-rs-renderer.workspace = true
 pulldown-cmark.workspace = true
+ratex-parser = "0.1"
+ratex-layout = "0.1"
+ratex-types = "0.1"
+ratex-svg = { version = "0.1", features = ["standalone", "embed-fonts"] }
 settings.workspace = true
 stacksafe.workspace = true
 sum_tree.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 ui.workspace = true
+usvg = { version = "0.45", default-features = false }
 util.workspace = true
 
 [dev-dependencies]

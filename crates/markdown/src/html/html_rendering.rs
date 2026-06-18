@@ -84,6 +84,7 @@ impl MarkdownElement {
                     &source_range,
                     markdown_end,
                     paragraph.text_align,
+                    false,
                 );
                 self.render_html_paragraph(
                     &paragraph.contents,
@@ -161,6 +162,7 @@ impl MarkdownElement {
                 div().child(bullet).into_any_element(),
                 &list_item.source_range,
                 markdown_end,
+                false,
             );
             self.render_html_elements(
                 &list_item.content,
