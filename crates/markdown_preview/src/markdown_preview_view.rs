@@ -712,7 +712,11 @@ impl MarkdownPreviewView {
             }
         }
 
-        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
+        let mut markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
+        // Links shouldn't have a highlighted background box in the preview.
+        markdown_style.link.background_color = None;
+        // Make headings semibold (they only get a size by default).
+        markdown_style.heading.text.font_weight = Some(FontWeight::SEMIBOLD);
         let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
         .code_block_renderer(CodeBlockRenderer::Default {
             copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
