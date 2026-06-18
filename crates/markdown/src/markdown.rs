@@ -1625,6 +1625,9 @@ impl Element for MarkdownElement {
         let mut current_img_block_range: Option<Range<usize>> = None;
         let mut handled_html_block = false;
         let mut rendered_mermaid_block = false;
+        // A `<center>`/`</center>` HTML block toggles centering instead of
+        // pushing a div, so its matching `End(HtmlBlock)` must skip the pop.
+        let mut skip_html_block_pop = false;
         for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
             // Skip alt text for images that rendered
             if let Some(current_img_block_range) = &current_img_block_range
@@ -1815,10 +1818,47 @@ impl Element for MarkdownElement {
                             }
                         }
                         MarkdownTag::HtmlBlock => {
-                            builder.push_div(div(), range, markdown_end);
-                            if let Some(block) = parsed_markdown.html_blocks.get(&range.start) {
-                                self.render_html_block(block, &mut builder, markdown_end, cx);
+                            // `<center>` / `</center>` (Obsidian-compatible) toggle
+                            // centering for the markdown blocks between them, rather
+                            // than rendering as an HTML element. The content keeps its
+                            // normal markdown pipeline, so inline/display math renders.
+                            let raw = parsed_markdown.source[range.clone()].trim();
+                            let lower = raw.to_ascii_lowercase();
+                            // Only a lone tag on its own line is a directive; a
+                            // multi-line block means the user omitted the blank
+                            // lines, so fall through and render it as HTML.
+                            let single_line = !raw.contains('\n');
+                            if single_line && lower.starts_with("<center") {
+                                // Center the block as a group while keeping its
+                                // lines left-aligned: a full-width row centers a
+                                // content-width column. Both divs stay open until
+                                // `</center>`; the matching End(HtmlBlock) skips
+                                // the default pop.
+                                builder.push_div(
+                                    div().w_full().flex().flex_row().justify_center(),
+                                    range,
+                                    markdown_end,
+                                );
+                                builder.push_div(
+                                    div().flex().flex_col().items_start(),
+                                    range,
+                                    markdown_end,
+                                );
                                 handled_html_block = true;
+                                skip_html_block_pop = true;
+                            } else if single_line && lower.starts_with("</center") {
+                                builder.pop_div(); // inner left-aligned column
+                                builder.pop_div(); // outer centering row
+                                handled_html_block = true;
+                                skip_html_block_pop = true;
+                            } else {
+                                builder.push_div(div(), range, markdown_end);
+                                if let Some(block) =
+                                    parsed_markdown.html_blocks.get(&range.start)
+                                {
+                                    self.render_html_block(block, &mut builder, markdown_end, cx);
+                                    handled_html_block = true;
+                                }
                             }
                         }
                         MarkdownTag::List(bullet_index) => {
@@ -2084,7 +2124,13 @@ impl Element for MarkdownElement {
                         // Pop the parent container.
                         builder.pop_div();
                     }
-                    MarkdownTagEnd::HtmlBlock => builder.pop_div(),
+                    MarkdownTagEnd::HtmlBlock => {
+                        if skip_html_block_pop {
+                            skip_html_block_pop = false;
+                        } else {
+                            builder.pop_div();
+                        }
+                    }
                     MarkdownTagEnd::List(_) => {
                         builder.pop_list();
                         builder.pop_div();
