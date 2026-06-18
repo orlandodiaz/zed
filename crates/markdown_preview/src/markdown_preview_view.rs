@@ -54,6 +54,7 @@ pub struct MarkdownPreviewView {
     base_directory: Option<PathBuf>,
     pending_update_task: Option<Task<Result<()>>>,
     mode: MarkdownPreviewMode,
+    show_footnotes: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -349,6 +350,7 @@ impl MarkdownPreviewView {
                 base_directory: None,
                 pending_update_task: None,
                 mode,
+                show_footnotes: false,
             };
 
             this.set_editor(active_editor, window, cx);
@@ -458,6 +460,15 @@ impl MarkdownPreviewView {
         }
     }
 
+    fn toggle_footnotes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_footnotes = !self.show_footnotes;
+        if let Some(editor) = self.active_editor.as_ref().map(|state| state.editor.clone()) {
+            let task = self.schedule_markdown_update(false, false, editor, window, cx);
+            self.pending_update_task = Some(task);
+        }
+        cx.notify();
+    }
+
     fn schedule_markdown_update(
         &mut self,
         wait_for_debounce: bool,
@@ -487,6 +498,11 @@ impl MarkdownPreviewView {
                     let selection_start = Self::selected_source_index(editor, cx);
                     (contents, selection_start)
                 });
+                let contents = if view.show_footnotes {
+                    contents
+                } else {
+                    strip_footnotes(&contents)
+                };
                 Some((SharedString::from(contents), selection_start))
             })?;
 
@@ -921,6 +937,43 @@ fn open_wikilink_target(
     true
 }
 
+/// Hide inline footnote references (`[^label]`) from the source so they don't
+/// clutter the prose, while keeping the footnote definition lines
+/// (`[^label]: ...`) intact so the sources/footnotes section still renders.
+/// Uses the official `[^...]` syntax, which is unambiguous (unlike bare `[1]`,
+/// which collides with array indices in code).
+fn strip_footnotes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        // Keep footnote definition lines (`[^label]:`) so the sources section
+        // still renders; only the inline markers in prose are removed.
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("[^") {
+            if let Some(close) = rest.find(']') {
+                if rest[close + 1..].starts_with(':') {
+                    out.push_str(line);
+                    continue;
+                }
+            }
+        }
+        // Strip inline references `[^label]` (and a single space before them).
+        let mut rest = line;
+        while let Some(start) = rest.find("[^") {
+            let Some(close_rel) = rest[start + 2..].find(']') else {
+                break;
+            };
+            let mut before = &rest[..start];
+            if before.ends_with(' ') {
+                before = &before[..before.len() - 1];
+            }
+            out.push_str(before);
+            rest = &rest[start + 2 + close_rel + 1..];
+        }
+        out.push_str(rest);
+    }
+    out
+}
+
 fn resolve_preview_path(url: &str, base_directory: Option<&Path>) -> Option<PathBuf> {
     if url.starts_with("http://") || url.starts_with("https://") {
         return None;
@@ -1164,14 +1217,33 @@ impl Render for MarkdownPreviewView {
                     })),
             )
             .child(
-                div().absolute().top_2().right_4().child(
-                    IconButton::new("markdown-toggle-edit", IconName::Pencil)
-                        .icon_size(IconSize::Small)
-                        .tooltip(Tooltip::text("Edit Markdown"))
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(ToggleEditPreview), cx);
-                        }),
-                ),
+                div()
+                    .absolute()
+                    .top_2()
+                    .right_4()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        IconButton::new("markdown-toggle-footnotes", IconName::Hash)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(!self.show_footnotes)
+                            .tooltip(Tooltip::text(if self.show_footnotes {
+                                "Hide footnotes"
+                            } else {
+                                "Show footnotes"
+                            }))
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.toggle_footnotes(window, cx);
+                            })),
+                    )
+                    .child(
+                        IconButton::new("markdown-toggle-edit", IconName::Pencil)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Edit Markdown"))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(ToggleEditPreview), cx);
+                            }),
+                    ),
             )
     }
 }
