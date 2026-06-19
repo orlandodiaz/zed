@@ -1069,8 +1069,16 @@ impl MarkdownElement {
         wrap_inline: bool,
     ) {
         let align = text_align_override.unwrap_or(self.style.base_text_style.text_align);
+        let in_footnote = builder.in_footnote;
         let mut paragraph = div().when(!self.style.height_is_multiple_of_line_height, |el| {
-            el.mb_4().line_height(rems(1.5))
+            // Footnote/source paragraphs stay tight (match the definition row's
+            // line height, small bottom margin) so the sources list isn't spread
+            // out by full body-paragraph spacing.
+            if in_footnote {
+                el.mb_1().line_height(rems(1.3))
+            } else {
+                el.mb_4().line_height(rems(1.5))
+            }
         });
 
         // Paragraphs containing inline math become a wrapping flex row of
@@ -1844,11 +1852,16 @@ impl Element for MarkdownElement {
                                     range,
                                     markdown_end,
                                 );
+                                builder.open_centers += 1;
                                 handled_html_block = true;
                                 skip_html_block_pop = true;
-                            } else if single_line && lower.starts_with("</center") {
+                            } else if single_line
+                                && lower.starts_with("</center")
+                                && builder.open_centers > 0
+                            {
                                 builder.pop_div(); // inner left-aligned column
                                 builder.pop_div(); // outer centering row
+                                builder.open_centers -= 1;
                                 handled_html_block = true;
                                 skip_html_block_pop = true;
                             } else {
@@ -1972,6 +1985,7 @@ impl Element for MarkdownElement {
                             }
                         }
                         MarkdownTag::FootnoteDefinition(label) => {
+                            builder.in_footnote = true;
                             if !builder.rendered_footnote_separator {
                                 builder.rendered_footnote_separator = true;
                                 builder.push_div(
@@ -1989,12 +2003,12 @@ impl Element for MarkdownElement {
                                     .pt_1()
                                     .mb_1()
                                     .line_height(rems(1.3))
-                                    .text_size(rems(0.85))
+                                    .text_size(rems(1.1))
                                     .h_flex()
                                     .items_start()
                                     .gap_2()
                                     .child(
-                                        div().text_size(rems(0.85)).child(format!("{}.", label)),
+                                        div().text_size(rems(1.1)).child(format!("{}.", label)),
                                     ),
                                 range,
                                 markdown_end,
@@ -2165,6 +2179,7 @@ impl Element for MarkdownElement {
                     MarkdownTagEnd::FootnoteDefinition => {
                         builder.pop_div();
                         builder.pop_div();
+                        builder.in_footnote = false;
                     }
                     _ => log::debug!("unsupported markdown tag end: {:?}", tag),
                 },
@@ -2497,6 +2512,14 @@ struct MarkdownElementBuilder {
     /// When set, text is emitted as one element per word so the current div
     /// (a `flex_wrap` row) can wrap between words and around inline math.
     wrap_words: bool,
+    /// When set (inside a footnote/source definition), paragraphs use tight
+    /// spacing so the sources list isn't stretched out by body paragraph margins.
+    in_footnote: bool,
+    /// Number of `<center>` blocks whose centering divs are still on the stack.
+    /// Balanced at `build` so malformed input (a `</center>` not separated from
+    /// following content by a blank line, which CommonMark glues into one HTML
+    /// block) can't leave the div stack unbalanced and crash rendering.
+    open_centers: usize,
     html_comment: bool,
     rendered_footnote_separator: bool,
     base_text_style: TextStyle,
@@ -2536,6 +2559,8 @@ impl MarkdownElementBuilder {
             rendered_footnote_refs: Vec::new(),
             current_source_index: 0,
             wrap_words: false,
+            in_footnote: false,
+            open_centers: 0,
             html_comment: false,
             rendered_footnote_separator: false,
             base_text_style,
@@ -2829,6 +2854,13 @@ impl MarkdownElementBuilder {
     }
 
     fn build(mut self) -> RenderedMarkdown {
+        // Close any `<center>` blocks left open by malformed input so the div
+        // stack ends balanced (otherwise rendering crashes).
+        while self.open_centers > 0 {
+            self.pop_div(); // inner left-aligned column
+            self.pop_div(); // outer centering row
+            self.open_centers -= 1;
+        }
         debug_assert_eq!(self.div_stack.len(), 1);
         self.flush_text();
         RenderedMarkdown {
@@ -3192,6 +3224,23 @@ mod tests {
                 (6, 84),
             ]],
         );
+    }
+
+    #[gpui::test]
+    fn test_vwap_center_repro(cx: &mut TestAppContext) {
+        // Mirrors the VWAP wiki page that crashes on open: display math, a
+        // <center> block whose </center> is not blank-line-separated from the
+        // following list, multibyte dashes, and a footnote.
+        let content = "## Equation\n\n\
+            $$\\text{VWAP} = \\frac{\\sum_{i} p_i \\cdot v_i}{\\sum_{i} v_i}$$\n\n\
+            <center>\n\n\
+            $p_i$ — price of trade $i$\n\n\
+            $v_i$ — volume of trade $i$\n\n\
+            </center>\n\
+            - summation is over all trades [^2]\n\n\
+            ## Sources\n\n\
+            [^2]: Chan, Ernest P. pp. 55–65.\n";
+        let _ = render_markdown(content, cx);
     }
 
     fn render_markdown(markdown: &str, cx: &mut TestAppContext) -> RenderedText {
