@@ -1350,7 +1350,19 @@ impl GitPanel {
             let open_task = self
                 .workspace
                 .update(cx, |workspace, cx| {
-                    workspace.open_path_preview(path, None, false, false, true, window, cx)
+                    // Opening from the git panel is for viewing the diff, so keep
+                    // markdown a plain editor instead of auto-converting it to a
+                    // rendered preview.
+                    if path
+                        .path
+                        .file_name()
+                        .is_some_and(|name| name.ends_with(".md") || name.ends_with(".markdown"))
+                    {
+                        markdown_preview::SuppressAutoPreview::suppress_next(cx);
+                    }
+                    // allow_preview = true so clicking through files reuses the
+                    // single preview tab instead of piling up a tab per file.
+                    workspace.open_path_preview(path, None, false, true, true, window, cx)
                 })
                 .ok()?;
 

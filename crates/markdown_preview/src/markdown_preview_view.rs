@@ -102,6 +102,11 @@ impl MarkdownPreviewView {
                     // This add came from toggling a preview back to its editor.
                     return;
                 }
+                if crate::SuppressAutoPreview::take(cx) {
+                    // Opened explicitly as an editor (e.g. from the git panel to
+                    // view a file's diff); leave it as the source editor.
+                    return;
+                }
                 let Some(pane) = workspace
                     .panes()
                     .iter()
