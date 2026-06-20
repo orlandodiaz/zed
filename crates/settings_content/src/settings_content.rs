@@ -106,6 +106,9 @@ pub struct SettingsContent {
     /// Settings related to the file finder.
     pub file_finder: Option<FileFinderSettingsContent>,
 
+    /// Settings related to the markdown search (`markdown_search::Toggle`).
+    pub markdown_search: Option<MarkdownSearchSettingsContent>,
+
     pub git_panel: Option<GitPanelSettingsContent>,
 
     pub tabs: Option<ItemSettingsContent>,
@@ -729,6 +732,18 @@ pub struct FileFinderSettingsContent {
     ///
     /// Default: true
     pub include_directories: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct MarkdownSearchSettingsContent {
+    /// Directory globs (worktree-relative) whose folders count as "wiki" folders
+    /// in the markdown search. A folder shows up in folder results if it, or one
+    /// of its ancestors, matches one of these globs. Source/`node_modules` dirs,
+    /// which aren't wikis, are excluded.
+    ///
+    /// Default: ["**/*wiki*"]
+    pub wiki_paths: Option<Vec<String>>,
 }
 
 #[derive(

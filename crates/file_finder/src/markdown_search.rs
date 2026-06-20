@@ -2,6 +2,11 @@
 //! that matches both file names and file contents of `.md` files, showing each
 //! result as a title + folder breadcrumb + a highlighted content snippet.
 //!
+//! It also matches folders, but only "wiki" folders — directories that (or whose
+//! ancestor) match the `markdown_search.wiki_paths` globs — so monorepo source
+//! folders full of READMEs/docs aren't returned. Opening a folder reveals it in
+//! the project panel.
+//!
 //! For speed, the `.md` contents are read into an in-memory index once when the
 //! dialog opens; each keystroke then searches that index synchronously (no
 //! per-keystroke disk scan), the way Obsidian's search does.
@@ -10,15 +15,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use file_icons::FileIcons;
-use fs::Fs;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     SharedString, Task, WeakEntity, Window, actions, rems,
 };
 use picker::{Picker, PickerDelegate};
 use project::{Project, ProjectPath};
+use settings::Settings as _;
 use ui::{Color, HighlightedLabel, Icon, Label, LabelCommon, LabelSize, ListItem, prelude::*};
+use util::paths::{PathMatcher, PathStyle};
+use util::rel_path::RelPath;
 use workspace::{ModalView, Workspace};
+
+use crate::markdown_search_settings::MarkdownSearchSettings;
 
 actions!(
     markdown_search,
@@ -36,6 +45,22 @@ const ELLIPSIS: &str = "…";
 
 pub fn init(cx: &mut App) {
     cx.observe_new(MarkdownSearch::register).detach();
+}
+
+/// A directory is a "wiki" folder if it, or one of its ancestors, matches a
+/// configured `wiki_paths` glob.
+fn is_wiki(matcher: &PathMatcher, path: &RelPath) -> bool {
+    if matcher.is_match(path) {
+        return true;
+    }
+    let mut parent = path.parent();
+    while let Some(ancestor) = parent {
+        if matcher.is_match(ancestor) {
+            return true;
+        }
+        parent = ancestor.parent();
+    }
+    false
 }
 
 pub struct MarkdownSearch {
@@ -93,8 +118,28 @@ struct MarkdownDoc {
     content_lower: String,
 }
 
+/// A "wiki" folder.
+struct FolderEntry {
+    project_path: ProjectPath,
+    name: String,
+    name_lower: String,
+}
+
+/// The in-memory index built once when the dialog opens.
+struct Index {
+    docs: Vec<MarkdownDoc>,
+    folders: Vec<FolderEntry>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MatchKind {
+    File,
+    Folder,
+}
+
 struct MarkdownMatch {
     project_path: ProjectPath,
+    kind: MatchKind,
     title: SharedString,
     breadcrumb: SharedString,
     snippet: SharedString,
@@ -108,7 +153,7 @@ struct MarkdownMatch {
 pub struct MarkdownSearchDelegate {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
-    index: Option<Arc<Vec<MarkdownDoc>>>,
+    index: Option<Arc<Index>>,
     matches: Vec<MarkdownMatch>,
     selected_index: usize,
 }
@@ -124,17 +169,39 @@ impl MarkdownSearchDelegate {
         }
     }
 
-    /// Reads every `.md`/`.markdown` file's contents into an in-memory index,
-    /// then re-runs the current query against it.
+    /// Reads every `.md` file's contents and collects wiki folders into an
+    /// in-memory index, then re-runs the current query against it.
     fn load_index(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let wiki_matcher = PathMatcher::new(
+            &MarkdownSearchSettings::get_global(cx).wiki_paths,
+            PathStyle::local(),
+        )
+        .ok();
+
         let project = self.project.read(cx);
         let fs = project.fs().clone();
         let mut files: Vec<(ProjectPath, PathBuf, String)> = Vec::new();
+        let mut folders: Vec<FolderEntry> = Vec::new();
         for worktree in project.visible_worktrees(cx) {
             let worktree = worktree.read(cx);
             let worktree_id = worktree.id();
-            for entry in worktree.entries(true, 0) {
-                if !entry.is_file() {
+            // Exclude gitignored entries (e.g. node_modules).
+            for entry in worktree.entries(false, 0) {
+                let project_path = ProjectPath {
+                    worktree_id,
+                    path: entry.path.clone(),
+                };
+                if entry.is_dir() {
+                    if let Some(matcher) = &wiki_matcher
+                        && is_wiki(matcher, &entry.path)
+                        && let Some(name) = entry.path.file_name()
+                    {
+                        folders.push(FolderEntry {
+                            name_lower: name.to_ascii_lowercase(),
+                            name: name.to_string(),
+                            project_path,
+                        });
+                    }
                     continue;
                 }
                 let Some(name) = entry.path.file_name() else {
@@ -146,14 +213,7 @@ impl MarkdownSearchDelegate {
                 else {
                     continue;
                 };
-                files.push((
-                    ProjectPath {
-                        worktree_id,
-                        path: entry.path.clone(),
-                    },
-                    worktree.absolutize(&entry.path),
-                    title.to_string(),
-                ));
+                files.push((project_path, worktree.absolutize(&entry.path), title.to_string()));
             }
         }
 
@@ -173,12 +233,56 @@ impl MarkdownSearchDelegate {
             }
             picker
                 .update_in(cx, |picker, window, cx| {
-                    picker.delegate.index = Some(Arc::new(docs));
+                    picker.delegate.index = Some(Arc::new(Index { docs, folders }));
                     picker.refresh(window, cx);
                 })
                 .ok();
         })
         .detach();
+    }
+
+    /// Fast file-name-only matches from the worktree entries, shown while the
+    /// content index is still loading.
+    fn filename_matches(&self, query_lower: &str, cx: &App) -> Vec<MarkdownMatch> {
+        let mut out = Vec::new();
+        for worktree in self.project.read(cx).visible_worktrees(cx) {
+            let worktree = worktree.read(cx);
+            let worktree_id = worktree.id();
+            for entry in worktree.entries(false, 0) {
+                if !entry.is_file() {
+                    continue;
+                }
+                let Some(name) = entry.path.file_name() else {
+                    continue;
+                };
+                let Some(title) = name
+                    .strip_suffix(".md")
+                    .or_else(|| name.strip_suffix(".markdown"))
+                else {
+                    continue;
+                };
+                let Some(pos) = title.to_ascii_lowercase().find(query_lower) else {
+                    continue;
+                };
+                let project_path = ProjectPath {
+                    worktree_id,
+                    path: entry.path.clone(),
+                };
+                let breadcrumb = breadcrumb_for(&project_path);
+                out.push(MarkdownMatch {
+                    project_path,
+                    kind: MatchKind::File,
+                    title: title.to_string().into(),
+                    breadcrumb,
+                    snippet: SharedString::default(),
+                    snippet_highlights: Vec::new(),
+                    title_pos: pos,
+                });
+            }
+        }
+        out.sort_by_key(|m| (m.title_pos, m.title.len()));
+        out.truncate(MAX_RESULTS);
+        out
     }
 }
 
@@ -233,11 +337,25 @@ impl PickerDelegate for MarkdownSearchDelegate {
         };
         let path = m.project_path.clone();
         if let Some(workspace) = self.workspace.upgrade() {
-            workspace.update(cx, |workspace, cx| {
-                workspace
-                    .open_path_preview(path, None, true, true, true, window, cx)
-                    .detach_and_log_err(cx);
-            });
+            match m.kind {
+                MatchKind::File => {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace
+                            .open_path_preview(path, None, true, true, true, window, cx)
+                            .detach_and_log_err(cx);
+                    });
+                }
+                MatchKind::Folder => {
+                    // Reveal (and select) the folder in the project panel.
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.project().update(cx, |project, cx| {
+                            if let Some(id) = project.entry_for_path(&path, cx).map(|e| e.id) {
+                                cx.emit(project::Event::RevealInProjectPanel(id));
+                            }
+                        });
+                    });
+                }
+            }
         }
         cx.emit(DismissEvent);
     }
@@ -252,9 +370,12 @@ impl PickerDelegate for MarkdownSearchDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let m = self.matches.get(ix)?;
-        // Themed icon for the file (markdown icon from the active icon theme).
-        let icon = FileIcons::get_icon(m.project_path.path.as_std_path(), cx)
-            .map(|icon| Icon::from_path(icon).color(Color::Muted));
+        let path = m.project_path.path.as_std_path();
+        let icon = match m.kind {
+            MatchKind::File => FileIcons::get_icon(path, cx),
+            MatchKind::Folder => FileIcons::get_folder_icon(false, path, cx),
+        }
+        .map(|icon| Icon::from_path(icon).color(Color::Muted));
         Some(
             ListItem::new(ix)
                 .inset(true)
@@ -286,54 +407,10 @@ impl PickerDelegate for MarkdownSearchDelegate {
     }
 }
 
-impl MarkdownSearchDelegate {
-    /// Fast file-name-only matches from the worktree entries, shown while the
-    /// content index is still loading.
-    fn filename_matches(&self, query_lower: &str, cx: &App) -> Vec<MarkdownMatch> {
-        let mut out = Vec::new();
-        for worktree in self.project.read(cx).visible_worktrees(cx) {
-            let worktree = worktree.read(cx);
-            let worktree_id = worktree.id();
-            for entry in worktree.entries(true, 0) {
-                if !entry.is_file() {
-                    continue;
-                }
-                let Some(name) = entry.path.file_name() else {
-                    continue;
-                };
-                let Some(title) = name
-                    .strip_suffix(".md")
-                    .or_else(|| name.strip_suffix(".markdown"))
-                else {
-                    continue;
-                };
-                let Some(pos) = title.to_ascii_lowercase().find(query_lower) else {
-                    continue;
-                };
-                let project_path = ProjectPath {
-                    worktree_id,
-                    path: entry.path.clone(),
-                };
-                let breadcrumb = breadcrumb_for(&project_path);
-                out.push(MarkdownMatch {
-                    project_path,
-                    title: title.to_string().into(),
-                    breadcrumb,
-                    snippet: SharedString::default(),
-                    snippet_highlights: Vec::new(),
-                    title_pos: pos,
-                });
-            }
-        }
-        out.sort_by_key(|m| (m.title_pos, m.title.len()));
-        out.truncate(MAX_RESULTS);
-        out
-    }
-}
-
-fn search_index(index: &[MarkdownDoc], query_lower: &str) -> Vec<MarkdownMatch> {
+fn search_index(index: &Index, query_lower: &str) -> Vec<MarkdownMatch> {
     let mut out = Vec::new();
-    for doc in index {
+
+    for doc in &index.docs {
         let title_pos = doc.title_lower.find(query_lower).unwrap_or(usize::MAX);
         let content_pos = doc.content_lower.find(query_lower);
         if title_pos == usize::MAX && content_pos.is_none() {
@@ -345,6 +422,7 @@ fn search_index(index: &[MarkdownDoc], query_lower: &str) -> Vec<MarkdownMatch> 
         };
         out.push(MarkdownMatch {
             project_path: doc.project_path.clone(),
+            kind: MatchKind::File,
             title: doc.title.clone().into(),
             breadcrumb: breadcrumb_for(&doc.project_path),
             snippet: snippet.into(),
@@ -352,8 +430,24 @@ fn search_index(index: &[MarkdownDoc], query_lower: &str) -> Vec<MarkdownMatch> 
             title_pos,
         });
     }
-    // Title matches first (earlier match position, then shorter title), then
-    // content-only matches (title_pos == usize::MAX).
+
+    for folder in &index.folders {
+        let Some(title_pos) = folder.name_lower.find(query_lower) else {
+            continue;
+        };
+        out.push(MarkdownMatch {
+            project_path: folder.project_path.clone(),
+            kind: MatchKind::Folder,
+            title: folder.name.clone().into(),
+            breadcrumb: breadcrumb_for(&folder.project_path),
+            snippet: SharedString::default(),
+            snippet_highlights: Vec::new(),
+            title_pos,
+        });
+    }
+
+    // Name/title matches first (earlier match position, then shorter title),
+    // then content-only matches (title_pos == usize::MAX).
     out.sort_by_key(|m| (m.title_pos, m.title.len()));
     out.truncate(MAX_RESULTS);
     out

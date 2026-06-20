@@ -1354,6 +1354,14 @@
     // it in the project panel). A trailing "/" always matches directories only.
     "include_directories": true,
   },
+  // Settings for the markdown search (markdown_search::Toggle).
+  "markdown_search": {
+    // Directory globs (worktree-relative) whose folders count as "wiki" folders.
+    // A folder appears in folder results if it, or an ancestor, matches one of
+    // these globs. The default matches any folder whose name contains "wiki";
+    // set exact paths per project in that project's .zed/settings.json.
+    "wiki_paths": ["**/*wiki*"]
+  },
   // Whether or not to remove any trailing whitespace from lines of a buffer
   // before saving it.
   "remove_trailing_whitespace_on_save": true,

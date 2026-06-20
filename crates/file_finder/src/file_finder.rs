@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod file_finder_tests;
 pub mod markdown_search;
+pub mod markdown_search_settings;
 
 use futures::future::join_all;
 pub use open_path_prompt::OpenPathDelegate;

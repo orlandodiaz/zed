@@ -184,6 +184,7 @@ impl VsCodeSettings {
             editor: self.editor_settings_content(),
             extension: ExtensionSettingsContent::default(),
             file_finder: None,
+            markdown_search: None,
             git: self.git_settings_content(),
             git_panel: self.git_panel_settings_content(),
             global_lsp_settings: skip_default(GlobalLspSettingsContent {
