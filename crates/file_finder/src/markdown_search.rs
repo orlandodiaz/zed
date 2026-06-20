@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use file_icons::FileIcons;
 use fs::Fs;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
@@ -16,7 +17,7 @@ use gpui::{
 };
 use picker::{Picker, PickerDelegate};
 use project::{Project, ProjectPath};
-use ui::{Color, HighlightedLabel, Label, LabelCommon, LabelSize, ListItem, prelude::*};
+use ui::{Color, HighlightedLabel, Icon, Label, LabelCommon, LabelSize, ListItem, prelude::*};
 use workspace::{ModalView, Workspace};
 
 actions!(
@@ -248,14 +249,18 @@ impl PickerDelegate for MarkdownSearchDelegate {
         ix: usize,
         selected: bool,
         _window: &mut Window,
-        _cx: &mut Context<Picker<Self>>,
+        cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let m = self.matches.get(ix)?;
+        // Themed icon for the file (markdown icon from the active icon theme).
+        let icon = FileIcons::get_icon(m.project_path.path.as_std_path(), cx)
+            .map(|icon| Icon::from_path(icon).color(Color::Muted));
         Some(
             ListItem::new(ix)
                 .inset(true)
                 .spacing(ui::ListItemSpacing::Sparse)
                 .toggle_state(selected)
+                .start_slot::<Icon>(icon)
                 .child(
                     v_flex()
                         .child(Label::new(m.title.clone()).weight(FontWeight::SEMIBOLD))
