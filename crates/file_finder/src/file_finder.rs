@@ -63,9 +63,7 @@ actions!(
         /// Toggles the split direction menu.
         ToggleSplitMenu,
         /// Toggles whether directories are included in file finder results.
-        ToggleIncludeDirectories,
-        /// Opens the file finder filtered to Markdown (`.md`) files only.
-        ToggleMarkdown
+        ToggleIncludeDirectories
     ]
 );
 
@@ -111,7 +109,7 @@ impl FileFinder {
         workspace.register_action(
             |workspace, action: &workspace::ToggleFileFinder, window, cx| {
                 let Some(file_finder) = workspace.active_modal::<Self>(cx) else {
-                    Self::open(workspace, action.separate_history, false, window, cx).detach();
+                    Self::open(workspace, action.separate_history, window, cx).detach();
                     return;
                 };
 
@@ -123,17 +121,11 @@ impl FileFinder {
                 });
             },
         );
-
-        workspace.register_action(|workspace, _: &ToggleMarkdown, window, cx| {
-            // Open (or toggle off) the file finder restricted to `.md` files.
-            Self::open(workspace, false, true, window, cx).detach();
-        });
     }
 
     fn open(
         workspace: &mut Workspace,
         separate_history: bool,
-        markdown_only: bool,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<()> {
@@ -186,7 +178,6 @@ impl FileFinder {
                             currently_opened_path,
                             history_items.collect(),
                             separate_history,
-                            markdown_only,
                             window,
                             cx,
                         );
@@ -444,8 +435,6 @@ pub struct FileFinderDelegate {
     include_ignored_refresh: Task<()>,
     include_directories: bool,
     include_directories_refresh: Task<()>,
-    /// When set, only Markdown (`.md`/`.markdown`) files are shown.
-    markdown_only: bool,
 }
 
 /// Use a custom ordering for file finder: the regular one
@@ -862,7 +851,6 @@ impl FileFinderDelegate {
         currently_opened_path: Option<FoundPath>,
         history_items: Vec<FoundPath>,
         separate_history: bool,
-        markdown_only: bool,
         window: &mut Window,
         cx: &mut Context<FileFinder>,
     ) -> Self {
@@ -886,16 +874,7 @@ impl FileFinderDelegate {
             has_changed_selected_index: false,
             selected_index: 0,
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            history_items: if markdown_only {
-                history_items
-                    .into_iter()
-                    .filter(|found| {
-                        matches!(found.project.path.extension(), Some("md") | Some("markdown"))
-                    })
-                    .collect()
-            } else {
-                history_items
-            },
+            history_items,
             separate_history,
             first_update: true,
             filter_popover_menu_handle: PopoverMenuHandle::default(),
@@ -905,7 +884,6 @@ impl FileFinderDelegate {
             include_ignored_refresh: Task::ready(()),
             include_directories: FileFinderSettings::get_global(cx).include_directories,
             include_directories_refresh: Task::ready(()),
-            markdown_only,
         }
     }
 
@@ -970,7 +948,6 @@ impl FileFinderDelegate {
         self.cancel_flag.store(true, atomic::Ordering::Release);
         self.cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_flag = self.cancel_flag.clone();
-        let markdown_only = self.markdown_only;
         cx.spawn_in(window, async move |picker, cx| {
             let matches = fuzzy_nucleo::match_path_sets(
                 candidate_sets.as_slice(),
@@ -983,10 +960,6 @@ impl FileFinderDelegate {
             )
             .await
             .into_iter()
-            .filter(|m| {
-                !markdown_only
-                    || matches!(m.path.extension(), Some("md") | Some("markdown"))
-            })
             .map(ProjectPanelOrdMatch);
             let did_cancel = cancel_flag.load(atomic::Ordering::Acquire);
             picker
