@@ -6503,6 +6503,20 @@ impl ProjectPanel {
             )
     }
 
+    /// Absolute path of a markdown page's custom `assets/…/<name>.icon.svg`, as a
+    /// `SharedString` for `Icon::from_path` (which renders an on-disk SVG in its
+    /// own colors). `None` for non-markdown files or when no icon file exists.
+    fn markdown_page_icon(
+        &self,
+        worktree_id: WorktreeId,
+        page_path: &RelPath,
+        cx: &App,
+    ) -> Option<SharedString> {
+        let worktree = self.project.read(cx).worktree_for_id(worktree_id, cx)?;
+        let abs_path = resolve_markdown_page_icon(worktree.read(cx), page_path)?;
+        Some(SharedString::from(abs_path.to_string_lossy().into_owned()))
+    }
+
     fn details_for_entry(
         &self,
         entry: &Entry,
@@ -6530,7 +6544,8 @@ impl ProjectPanel {
         let icon = match entry.kind {
             EntryKind::File => {
                 if show_file_icons {
-                    FileIcons::get_icon(entry.path.as_std_path(), cx)
+                    self.markdown_page_icon(worktree_id, &entry.path, cx)
+                        .or_else(|| FileIcons::get_icon(entry.path.as_std_path(), cx))
                 } else {
                     None
                 }
@@ -7788,6 +7803,53 @@ fn entry_git_label_color(is_dir: bool, git_status: GitSummary, ignored: bool, ma
         git_status
     };
     entry_git_aware_label_color(git_status, ignored, marked)
+}
+
+/// Resolves an Obsidian-style custom page icon for a markdown file.
+///
+/// For a note `Foo.md`, looks for `Foo.icon.svg` inside an `assets/` folder at
+/// the page's wiki root (the nearest ancestor directory that contains an
+/// `assets/` folder). The path-mirrored location is checked first so two
+/// same-named pages in different folders can have distinct icons
+/// (`assets/<page-folder>/Foo.icon.svg`), then a flat `assets/Foo.icon.svg` so
+/// uniquely-named pages need no subfolder. Returns the absolute path to the
+/// icon SVG, or `None` when no matching file exists.
+pub fn resolve_markdown_page_icon(
+    worktree: &worktree::Worktree,
+    page_path: &RelPath,
+) -> Option<PathBuf> {
+    let extension = page_path.extension()?;
+    if !extension.eq_ignore_ascii_case("md") && !extension.eq_ignore_ascii_case("markdown") {
+        return None;
+    }
+    let stem = page_path.file_stem()?;
+    let icon_file_name = format!("{stem}.icon.svg");
+    let icon_name = RelPath::unix(&icon_file_name).ok()?;
+    let assets_dir = RelPath::unix("assets").ok()?;
+    let parent = page_path.parent().unwrap_or(RelPath::empty());
+
+    for root in parent.ancestors() {
+        let assets = root.join(assets_dir);
+        if !worktree
+            .entry_for_path(&assets)
+            .is_some_and(|entry| entry.is_dir())
+        {
+            continue;
+        }
+        // Path-mirrored: assets/<page-folder-relative-to-root>/<stem>.icon.svg
+        if let Ok(subpath) = parent.strip_prefix(root) {
+            let mirrored = assets.join(subpath).join(icon_name);
+            if worktree.entry_for_path(&mirrored).is_some() {
+                return Some(worktree.absolutize(&mirrored));
+            }
+        }
+        // Flat fallback: assets/<stem>.icon.svg
+        let flat = assets.join(icon_name);
+        if worktree.entry_for_path(&flat).is_some() {
+            return Some(worktree.absolutize(&flat));
+        }
+    }
+    None
 }
 
 #[cfg(test)]

@@ -169,6 +169,18 @@ impl MarkdownSearchDelegate {
         }
     }
 
+    /// Obsidian-style custom icon for a markdown page (`assets/…/<name>.icon.svg`),
+    /// as an absolute path for `Icon::from_path`. `None` when there's no icon file.
+    fn page_icon(&self, project_path: &ProjectPath, cx: &App) -> Option<SharedString> {
+        let worktree = self
+            .project
+            .read(cx)
+            .worktree_for_id(project_path.worktree_id, cx)?;
+        let abs_path =
+            project_panel::resolve_markdown_page_icon(worktree.read(cx), &project_path.path)?;
+        Some(SharedString::from(abs_path.to_string_lossy().into_owned()))
+    }
+
     /// Reads every `.md` file's contents and collects wiki folders into an
     /// in-memory index, then re-runs the current query against it.
     fn load_index(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
@@ -372,7 +384,9 @@ impl PickerDelegate for MarkdownSearchDelegate {
         let m = self.matches.get(ix)?;
         let path = m.project_path.path.as_std_path();
         let icon = match m.kind {
-            MatchKind::File => FileIcons::get_icon(path, cx),
+            MatchKind::File => self
+                .page_icon(&m.project_path, cx)
+                .or_else(|| FileIcons::get_icon(path, cx)),
             MatchKind::Folder => FileIcons::get_folder_icon(false, path, cx),
         }
         .map(|icon| Icon::from_path(icon).color(Color::Muted));

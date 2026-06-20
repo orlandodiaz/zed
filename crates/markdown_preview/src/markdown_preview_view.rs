@@ -1,7 +1,7 @@
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::cmp::min;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -15,7 +15,7 @@ use gpui::{
     App, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight,
     ImageSource,
     InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource, RetainAllImageCache,
-    ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point, px,
+    ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, img, point, px,
 };
 use language::LanguageRegistry;
 use markdown::{
@@ -52,6 +52,11 @@ pub struct MarkdownPreviewView {
     scroll_handle: ScrollHandle,
     image_cache: Entity<RetainAllImageCache>,
     base_directory: Option<PathBuf>,
+    /// Obsidian-style image resolution: maps a lowercased image filename to its
+    /// path anywhere in the project, so embeds like `![[hammer.svg]]` resolve
+    /// even when the file lives in an `attachments/` folder rather than next to
+    /// the note. Rebuilt whenever the preview content updates.
+    image_index: Rc<HashMap<String, PathBuf>>,
     pending_update_task: Option<Task<Result<()>>>,
     mode: MarkdownPreviewMode,
     show_footnotes: bool,
@@ -353,6 +358,7 @@ impl MarkdownPreviewView {
                 scroll_handle: ScrollHandle::new(),
                 image_cache: RetainAllImageCache::new(cx),
                 base_directory: None,
+                image_index: Rc::new(HashMap::new()),
                 pending_update_task: None,
                 mode,
                 show_footnotes: false,
@@ -516,6 +522,11 @@ impl MarkdownPreviewView {
                     view.markdown.update(cx, |markdown, cx| {
                         markdown.reset(contents, cx);
                     });
+                    view.image_index = Rc::new(build_image_index(
+                        &view.workspace,
+                        view.base_directory.as_deref(),
+                        cx,
+                    ));
                     view.sync_preview_to_source_index(selection_start, should_reveal_selection, cx);
                     cx.emit(SearchEvent::MatchesInvalidated);
                 }
@@ -594,6 +605,21 @@ impl MarkdownPreviewView {
         let abs_path = file.as_local()?.abs_path(cx);
         let stem = abs_path.file_stem()?.to_string_lossy().into_owned();
         Some(stem.into())
+    }
+
+    /// The page's Obsidian-style custom icon (`assets/…/<name>.icon.svg`), shown
+    /// before the document title. `None` when the page has no icon file.
+    fn current_page_icon(&self, cx: &App) -> Option<ImageSource> {
+        let editor = self.active_editor.as_ref()?.editor.read(cx);
+        let file = editor.file_at(MultiBufferOffset(0), cx)?;
+        let worktree_id = file.worktree_id(cx);
+        let page_path = file.path().clone();
+        let project = self.workspace.upgrade()?.read(cx).project().clone();
+        let worktree = project.read(cx).worktree_for_id(worktree_id, cx)?;
+        let abs_path = resolve_markdown_page_icon(worktree.read(cx), &page_path)?;
+        Some(ImageSource::Resource(Resource::Path(Arc::from(
+            abs_path.as_path(),
+        ))))
     }
 
     fn line_scroll_amount(&self, cx: &App) -> Pixels {
@@ -746,11 +772,13 @@ impl MarkdownPreviewView {
         .scroll_handle(self.scroll_handle.clone())
         .image_resolver({
             let base_directory = self.base_directory.clone();
+            let image_index = self.image_index.clone();
             move |dest_url| {
                 resolve_preview_image(
                     dest_url,
                     base_directory.as_deref(),
                     workspace_directory.as_deref(),
+                    &image_index,
                 )
             }
         })
@@ -1006,6 +1034,7 @@ fn resolve_preview_image(
     dest_url: &str,
     base_directory: Option<&Path>,
     workspace_directory: Option<&Path>,
+    image_index: &HashMap<String, PathBuf>,
 ) -> Option<ImageSource> {
     if dest_url.starts_with("data:") {
         return None;
@@ -1035,14 +1064,148 @@ fn resolve_preview_image(
     }
 
     let path = if Path::new(&decoded).is_absolute() {
-        PathBuf::from(decoded)
+        Some(PathBuf::from(&decoded))
     } else {
-        base_directory?.join(decoded)
+        base_directory.map(|base| base.join(&decoded))
     };
 
+    if let Some(path) = &path
+        && path.exists()
+    {
+        return Some(ImageSource::Resource(Resource::Path(Arc::from(
+            path.as_path(),
+        ))));
+    }
+
+    // Obsidian-style fallback: a bare filename (or a path whose file doesn't
+    // exist at the literal location) resolves to a matching image anywhere in
+    // the project.
+    if let Some(found) = Path::new(&decoded)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| image_index.get(&name.to_ascii_lowercase()))
+    {
+        return Some(ImageSource::Resource(Resource::Path(Arc::from(
+            found.as_path(),
+        ))));
+    }
+
+    // Preserve the prior behavior of handing back the literal path even when it
+    // doesn't exist (the image element shows its own broken-image state).
+    let path = path?;
     Some(ImageSource::Resource(Resource::Path(Arc::from(
         path.as_path(),
     ))))
+}
+
+/// Image file extensions resolvable via the Obsidian-style filename index.
+/// Mirrors the formats gpui's `img()` element can decode (raster + `svg`).
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "avif", "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "tga", "bmp", "ico", "svg",
+];
+
+/// Index every image file in the project by its lowercased filename so embeds
+/// can be resolved by name alone, like an Obsidian vault. On a filename
+/// collision, the file sharing the most path components with the note wins.
+fn build_image_index(
+    workspace: &WeakEntity<Workspace>,
+    base_directory: Option<&Path>,
+    cx: &App,
+) -> HashMap<String, PathBuf> {
+    use std::collections::hash_map::Entry;
+
+    let mut index: HashMap<String, PathBuf> = HashMap::new();
+    let Some(workspace) = workspace.upgrade() else {
+        return index;
+    };
+    let project = workspace.read(cx).project().read(cx);
+    for worktree in project.worktrees(cx) {
+        let worktree = worktree.read(cx);
+        let root = worktree.abs_path();
+        // include_ignored: wiki attachments are often gitignored.
+        for entry in worktree.files(true, 0) {
+            let Some(extension) = entry.path.extension() else {
+                continue;
+            };
+            if !IMAGE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()) {
+                continue;
+            }
+            let Some(file_name) = entry.path.file_name() else {
+                continue;
+            };
+            let key = file_name.to_ascii_lowercase();
+            let abs_path = root.join(entry.path.as_std_path());
+            match index.entry(key) {
+                Entry::Occupied(mut slot) => {
+                    if shared_ancestor_len(&abs_path, base_directory)
+                        > shared_ancestor_len(slot.get(), base_directory)
+                    {
+                        slot.insert(abs_path);
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(abs_path);
+                }
+            }
+        }
+    }
+    index
+}
+
+/// Resolves an Obsidian-style custom page icon for a markdown file: for `Foo.md`,
+/// looks for `Foo.icon.svg` in an `assets/` folder at the page's wiki root,
+/// checking the path-mirrored `assets/<page-folder>/Foo.icon.svg` first (so
+/// same-named pages stay distinct), then a flat `assets/Foo.icon.svg`. Mirrors
+/// `project_panel::resolve_markdown_page_icon` (duplicated to avoid a dependency
+/// on the project panel from the preview).
+fn resolve_markdown_page_icon(
+    worktree: &project::Worktree,
+    page_path: &util::rel_path::RelPath,
+) -> Option<PathBuf> {
+    use util::rel_path::RelPath;
+
+    let extension = page_path.extension()?;
+    if !extension.eq_ignore_ascii_case("md") && !extension.eq_ignore_ascii_case("markdown") {
+        return None;
+    }
+    let stem = page_path.file_stem()?;
+    let icon_file_name = format!("{stem}.icon.svg");
+    let icon_name = RelPath::unix(&icon_file_name).ok()?;
+    let assets_dir = RelPath::unix("assets").ok()?;
+    let parent = page_path.parent().unwrap_or(RelPath::empty());
+
+    for root in parent.ancestors() {
+        let assets = root.join(assets_dir);
+        if !worktree
+            .entry_for_path(&assets)
+            .is_some_and(|entry| entry.is_dir())
+        {
+            continue;
+        }
+        if let Ok(subpath) = parent.strip_prefix(root) {
+            let mirrored = assets.join(subpath).join(icon_name);
+            if worktree.entry_for_path(&mirrored).is_some() {
+                return Some(worktree.absolutize(&mirrored));
+            }
+        }
+        let flat = assets.join(icon_name);
+        if worktree.entry_for_path(&flat).is_some() {
+            return Some(worktree.absolutize(&flat));
+        }
+    }
+    None
+}
+
+/// Number of leading path components `path` shares with `base`, used to prefer
+/// the image closest to the note when a filename appears in multiple folders.
+fn shared_ancestor_len(path: &Path, base: Option<&Path>) -> usize {
+    let Some(base) = base else {
+        return 0;
+    };
+    path.components()
+        .zip(base.components())
+        .take_while(|(a, b)| a == b)
+        .count()
 }
 
 impl Focusable for MarkdownPreviewView {
@@ -1193,11 +1356,18 @@ impl Render for MarkdownPreviewView {
                     // size); headings set their own size so they're unaffected.
                     .text_size(px(15.0))
                     .children(self.document_title(cx).map(|title| {
-                        div()
+                        h_flex()
                             .pb_3()
-                            .text_3xl()
-                            .font_weight(FontWeight::BOLD)
-                            .child(title)
+                            .gap_2()
+                            .when_some(self.current_page_icon(cx), |this, icon| {
+                                this.child(img(icon).w(px(30.)).h(px(30.)).flex_none())
+                            })
+                            .child(
+                                div()
+                                    .text_3xl()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(title),
+                            )
                     }))
                     .child(WithRemSize::new(rem_size).child({
                         let markdown_element = self.render_markdown_element(window, cx);
@@ -1398,6 +1568,7 @@ mod tests {
     use crate::markdown_preview_view::Resource;
     use crate::markdown_preview_view::resolve_preview_image;
     use anyhow::Result;
+    use std::collections::HashMap;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1453,6 +1624,7 @@ mod tests {
             "/test_image.png",
             Some(&base_directory),
             Some(workspace_directory),
+            &HashMap::new(),
         );
 
         match resolved_success {
@@ -1466,6 +1638,7 @@ mod tests {
             "/missing_image.png",
             Some(&base_directory),
             Some(workspace_directory),
+            &HashMap::new(),
         );
 
         let expected_missing_path = if std::path::Path::new("/missing_image.png").is_absolute() {
@@ -1481,6 +1654,57 @@ mod tests {
                 assert_eq!(p.as_ref(), expected_missing_path.as_path());
             }
             _ => panic!("Expected missing file to fallback to a Resource::Path"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_obsidian_embed_by_filename() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let workspace_directory = temp_dir.path();
+
+        // Note lives in `notes/`, image lives in `attachments/` — the Obsidian
+        // layout where the embed only names the file, not its location.
+        let base_directory = workspace_directory.join("notes");
+        fs::create_dir_all(&base_directory)?;
+        let attachments = workspace_directory.join("attachments");
+        fs::create_dir_all(&attachments)?;
+        let image_file = attachments.join("hammer-candlestick.svg");
+        fs::write(&image_file, "<svg/>")?;
+
+        let mut image_index = HashMap::new();
+        image_index.insert("hammer-candlestick.svg".to_string(), image_file.clone());
+
+        // A bare filename resolves to the indexed path even though it isn't next
+        // to the note.
+        let resolved = resolve_preview_image(
+            "hammer-candlestick.svg",
+            Some(&base_directory),
+            Some(workspace_directory),
+            &image_index,
+        );
+        match resolved {
+            Some(ImageSource::Resource(Resource::Path(p))) => {
+                assert_eq!(p.as_ref(), image_file.as_path());
+            }
+            _ => panic!("Expected the embed to resolve via the filename index"),
+        }
+
+        // A real file next to the note still takes precedence over the index.
+        let local_image = base_directory.join("hammer-candlestick.svg");
+        fs::write(&local_image, "<svg/>")?;
+        let resolved_local = resolve_preview_image(
+            "hammer-candlestick.svg",
+            Some(&base_directory),
+            Some(workspace_directory),
+            &image_index,
+        );
+        match resolved_local {
+            Some(ImageSource::Resource(Resource::Path(p))) => {
+                assert_eq!(p.as_ref(), local_image.as_path());
+            }
+            _ => panic!("Expected the local file to take precedence"),
         }
 
         Ok(())

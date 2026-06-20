@@ -10167,6 +10167,56 @@ async fn test_folder_chevrons_setting(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+async fn test_resolve_markdown_page_icon(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "wiki": {
+                "Doji.md": "",
+                "notes.txt": "",
+                "trading": { "Hammer.md": "" },
+                "patterns": { "Hammer.md": "" },
+                "assets": {
+                    "Doji.icon.svg": "<svg/>",
+                    "trading": { "Hammer.icon.svg": "<svg/>" },
+                },
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    cx.run_until_parked();
+    let worktree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
+
+    worktree.read_with(cx, |worktree, _| {
+        // Flat icon: a uniquely-named page resolves to `assets/<name>.icon.svg`.
+        assert_eq!(
+            resolve_markdown_page_icon(worktree, rel_path("wiki/Doji.md")),
+            Some(PathBuf::from(path!("/root/wiki/assets/Doji.icon.svg"))),
+        );
+        // Path-mirrored icon disambiguates same-named pages by folder.
+        assert_eq!(
+            resolve_markdown_page_icon(worktree, rel_path("wiki/trading/Hammer.md")),
+            Some(PathBuf::from(path!("/root/wiki/assets/trading/Hammer.icon.svg"))),
+        );
+        // A same-named page without its own mirrored icon gets no false match.
+        assert_eq!(
+            resolve_markdown_page_icon(worktree, rel_path("wiki/patterns/Hammer.md")),
+            None,
+        );
+        // Non-markdown files never get a page icon.
+        assert_eq!(
+            resolve_markdown_page_icon(worktree, rel_path("wiki/notes.txt")),
+            None,
+        );
+    });
+}
+
 pub(crate) fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);
