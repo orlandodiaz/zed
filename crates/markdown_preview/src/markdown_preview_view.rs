@@ -13,9 +13,9 @@ use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
 use gpui::{
     App, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight,
-    ImageSource,
-    InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource, RetainAllImageCache,
-    ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point, px,
+    Hsla, ImageSource, InteractiveElement, IntoElement, IsZero, Pixels, Render, RenderImage,
+    Resource, RetainAllImageCache, Rgba, ScrollHandle, SharedString, SharedUri, Subscription,
+    SvgRenderer, Task, WeakEntity, Window, point, px,
 };
 use language::LanguageRegistry;
 use markdown::{
@@ -64,6 +64,11 @@ pub struct MarkdownPreviewView {
     link_icon_index: Rc<HashMap<String, PathBuf>>,
     /// Path to the current page's icon SVG, rendered as vector in the title.
     page_icon_path: Option<PathBuf>,
+    /// Rasterized embedded SVGs keyed by (file, modified-time, theme text color):
+    /// the mtime means edits to the file show without a restart (gpui's image
+    /// cache never reloads a path), and the color means `currentColor` follows the
+    /// theme — both without re-rasterizing every frame.
+    svg_theme_cache: Rc<RefCell<HashMap<(PathBuf, u64, u32), Arc<RenderImage>>>>,
     pending_update_task: Option<Task<Result<()>>>,
     mode: MarkdownPreviewMode,
     show_footnotes: bool,
@@ -368,6 +373,7 @@ impl MarkdownPreviewView {
                 image_index: Rc::new(HashMap::new()),
                 link_icon_index: Rc::new(HashMap::new()),
                 page_icon_path: None,
+                svg_theme_cache: Rc::new(RefCell::new(HashMap::new())),
                 pending_update_task: None,
                 mode,
                 show_footnotes: false,
@@ -789,13 +795,18 @@ impl MarkdownPreviewView {
         .image_resolver({
             let base_directory = self.base_directory.clone();
             let image_index = self.image_index.clone();
+            let svg_renderer = cx.svg_renderer();
+            let text_color = cx.theme().colors().text;
+            let cache = self.svg_theme_cache.clone();
             move |dest_url| {
-                resolve_preview_image(
+                let source = resolve_preview_image(
                     dest_url,
                     base_directory.as_deref(),
                     workspace_directory.as_deref(),
                     &image_index,
-                )
+                )?;
+                // Make embedded SVGs that use `currentColor` follow the theme.
+                Some(theme_embedded_svg(source, text_color, &svg_renderer, &cache))
             }
         })
         .link_icon_resolver({
@@ -1118,6 +1129,72 @@ fn resolve_preview_image(
     Some(ImageSource::Resource(Resource::Path(Arc::from(
         path.as_path(),
     ))))
+}
+
+/// Rasterizes an embedded SVG ourselves so that (a) any `currentColor` follows
+/// the theme's text color, and (b) edits to the file show without a restart —
+/// gpui's image cache is keyed by path and never reloads, so we key our own
+/// cache on the file's modified-time. Non-SVG sources pass through to `img()`.
+fn theme_embedded_svg(
+    source: ImageSource,
+    text_color: Hsla,
+    svg_renderer: &SvgRenderer,
+    cache: &RefCell<HashMap<(PathBuf, u64, u32), Arc<RenderImage>>>,
+) -> ImageSource {
+    let ImageSource::Resource(Resource::Path(path)) = &source else {
+        return source;
+    };
+    let is_svg = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"));
+    if !is_svg {
+        return source;
+    }
+
+    let mtime = std::fs::metadata(path.as_ref())
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|dur| dur.as_millis() as u64)
+        .unwrap_or(0);
+    let cache_key = (path.to_path_buf(), mtime, theme_color_key(text_color));
+    if let Some(image) = cache.borrow().get(&cache_key) {
+        return ImageSource::Render(image.clone());
+    }
+
+    let Ok(text) = std::fs::read_to_string(path.as_ref()) else {
+        return source;
+    };
+    let themed = if text.contains("currentColor") {
+        text.replace("currentColor", &theme_color_hex(text_color))
+    } else {
+        text
+    };
+    match svg_renderer.render_single_frame(themed.as_bytes(), 1.0) {
+        Ok(image) => {
+            cache.borrow_mut().insert(cache_key, image.clone());
+            ImageSource::Render(image)
+        }
+        Err(_) => source,
+    }
+}
+
+fn theme_color_hex(color: Hsla) -> String {
+    let rgba: Rgba = color.into();
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (rgba.r * 255.0).round() as u8,
+        (rgba.g * 255.0).round() as u8,
+        (rgba.b * 255.0).round() as u8,
+    )
+}
+
+fn theme_color_key(color: Hsla) -> u32 {
+    let rgba: Rgba = color.into();
+    ((rgba.r * 255.0).round() as u32) << 16
+        | ((rgba.g * 255.0).round() as u32) << 8
+        | ((rgba.b * 255.0).round() as u32)
 }
 
 /// Image file extensions resolvable via the Obsidian-style filename index.
