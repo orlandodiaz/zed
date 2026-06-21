@@ -50,9 +50,6 @@ static CACHE: LazyLock<Mutex<HashMap<CacheKey, Arc<CachedMath>>>> =
 /// caller's `em_px` afterwards. Larger keeps integer rounding in the SVG small.
 const UNITS_PER_EM: f64 = 40.0;
 
-/// Display math (`$$…$$`) is rendered this much larger than the surrounding
-/// body text, since it stands alone on its own centered line. Tunable.
-const DISPLAY_MATH_SCALE: f32 = 1.2;
 
 /// Inline math sits in a `flex_wrap` row that gpui aligns by the box's bottom
 /// edge (gpui plumbs no text baseline to layout). The RaTeX box includes the
@@ -62,9 +59,9 @@ const DISPLAY_MATH_SCALE: f32 = 1.2;
 const INLINE_BASELINE_LIFT_EM: f32 = 0.3;
 
 /// Render display math (`$$…$$`) as a centered block element, or `None` if the
-/// LaTeX fails to parse.
-pub fn display_math(latex: &str, em_px: Pixels, color: Hsla) -> Option<AnyElement> {
-    let em_px = px(f32::from(em_px) * DISPLAY_MATH_SCALE);
+/// LaTeX fails to parse. `scale` is how much larger than body text it renders.
+pub fn display_math(latex: &str, em_px: Pixels, color: Hsla, scale: f32) -> Option<AnyElement> {
+    let em_px = px(f32::from(em_px) * scale);
     let cached = render_geometry(latex, true, em_px)?;
     Some(
         div()

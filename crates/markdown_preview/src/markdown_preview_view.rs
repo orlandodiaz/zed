@@ -15,7 +15,7 @@ use gpui::{
     App, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight,
     ImageSource,
     InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource, RetainAllImageCache,
-    ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, img, point, px,
+    ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point, px,
 };
 use language::LanguageRegistry;
 use markdown::{
@@ -34,6 +34,7 @@ use workspace::searchable::{
 };
 use workspace::{ItemNavHistory, OpenOptions, OpenVisible, Pane, Workspace};
 
+use crate::markdown_preview_settings::MarkdownPreviewSettings;
 use crate::{
     OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide, ScrollDown, ScrollDownByItem,
     ToggleEditPreview,
@@ -57,6 +58,12 @@ pub struct MarkdownPreviewView {
     /// even when the file lives in an `attachments/` folder rather than next to
     /// the note. Rebuilt whenever the preview content updates.
     image_index: Rc<HashMap<String, PathBuf>>,
+    /// Maps a page name (the stem of `<name>.icon.svg` under an `assets/` folder)
+    /// to its icon, so a wikilink leading a table cell or list item can show the
+    /// target page's icon. Rebuilt whenever the preview content updates.
+    link_icon_index: Rc<HashMap<String, PathBuf>>,
+    /// Path to the current page's icon SVG, rendered as vector in the title.
+    page_icon_path: Option<PathBuf>,
     pending_update_task: Option<Task<Result<()>>>,
     mode: MarkdownPreviewMode,
     show_footnotes: bool,
@@ -359,6 +366,8 @@ impl MarkdownPreviewView {
                 image_cache: RetainAllImageCache::new(cx),
                 base_directory: None,
                 image_index: Rc::new(HashMap::new()),
+                link_icon_index: Rc::new(HashMap::new()),
+                page_icon_path: None,
                 pending_update_task: None,
                 mode,
                 show_footnotes: false,
@@ -527,6 +536,8 @@ impl MarkdownPreviewView {
                         view.base_directory.as_deref(),
                         cx,
                     ));
+                    view.link_icon_index = Rc::new(build_link_icon_index(&view.workspace, cx));
+                    view.page_icon_path = view.current_page_icon(cx);
                     view.sync_preview_to_source_index(selection_start, should_reveal_selection, cx);
                     cx.emit(SearchEvent::MatchesInvalidated);
                 }
@@ -607,19 +618,16 @@ impl MarkdownPreviewView {
         Some(stem.into())
     }
 
-    /// The page's Obsidian-style custom icon (`assets/…/<name>.icon.svg`), shown
-    /// before the document title. `None` when the page has no icon file.
-    fn current_page_icon(&self, cx: &App) -> Option<ImageSource> {
+    /// Path to the page's Obsidian-style custom icon (`assets/…/<name>.icon.svg`),
+    /// shown before the document title. `None` when the page has no icon file.
+    fn current_page_icon(&self, cx: &App) -> Option<PathBuf> {
         let editor = self.active_editor.as_ref()?.editor.read(cx);
         let file = editor.file_at(MultiBufferOffset(0), cx)?;
         let worktree_id = file.worktree_id(cx);
         let page_path = file.path().clone();
         let project = self.workspace.upgrade()?.read(cx).project().clone();
         let worktree = project.read(cx).worktree_for_id(worktree_id, cx)?;
-        let abs_path = resolve_markdown_page_icon(worktree.read(cx), &page_path)?;
-        Some(ImageSource::Resource(Resource::Path(Arc::from(
-            abs_path.as_path(),
-        ))))
+        resolve_markdown_page_icon(worktree.read(cx), &page_path)
     }
 
     fn line_scroll_amount(&self, cx: &App) -> Pixels {
@@ -764,6 +772,14 @@ impl MarkdownPreviewView {
         markdown_style.link.background_color = None;
         // Make headings semibold (they only get a size by default).
         markdown_style.heading.text.font_weight = Some(FontWeight::SEMIBOLD);
+        // Don't bold table header cells (wiki tables of links look heavy bolded).
+        markdown_style.table_header_text.font_weight = None;
+        // Cap embedded images so a large-intrinsic-size SVG (e.g. a 1024px logo)
+        // doesn't fill the whole preview width. Aspect ratio is preserved.
+        markdown_style.image_max_height = Some(px(360.).into());
+        // Display math size is user-tunable via settings (no recompile needed).
+        markdown_style.display_math_scale =
+            MarkdownPreviewSettings::get_global(cx).display_math_scale;
         let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
         .code_block_renderer(CodeBlockRenderer::Default {
             copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
@@ -782,6 +798,12 @@ impl MarkdownPreviewView {
                 )
             }
         })
+        .link_icon_resolver({
+            let link_icon_index = self.link_icon_index.clone();
+            move |dest_url| link_icon_index.get(&dest_url.to_ascii_lowercase()).cloned()
+        })
+        // (resolver returns the icon SVG path; the markdown element renders it as
+        // crisp vector geometry rather than a rasterized image.)
         .on_url_click({
             let view_handle = cx.entity().downgrade();
             let workspace = self.workspace.clone();
@@ -1196,6 +1218,44 @@ fn resolve_markdown_page_icon(
     None
 }
 
+/// Index page icons by page name for wikilink resolution: every `<name>.icon.svg`
+/// under an `assets/` folder maps its lowercased `<name>` to the icon, so a
+/// wikilink `[[Name]]` can show the target page's icon.
+fn build_link_icon_index(
+    workspace: &WeakEntity<Workspace>,
+    cx: &App,
+) -> HashMap<String, PathBuf> {
+    let mut index: HashMap<String, PathBuf> = HashMap::new();
+    let Some(workspace) = workspace.upgrade() else {
+        return index;
+    };
+    let project = workspace.read(cx).project().read(cx);
+    for worktree in project.worktrees(cx) {
+        let worktree = worktree.read(cx);
+        // include_ignored: wiki assets are often gitignored.
+        for entry in worktree.files(true, 0) {
+            let Some(file_name) = entry.path.file_name() else {
+                continue;
+            };
+            let lower = file_name.to_ascii_lowercase();
+            let Some(stem) = lower.strip_suffix(".icon.svg") else {
+                continue;
+            };
+            if stem.is_empty()
+                || !entry
+                    .path
+                    .ancestors()
+                    .any(|ancestor| ancestor.file_name() == Some("assets"))
+            {
+                continue;
+            }
+            let abs_path = worktree.absolutize(&entry.path);
+            index.insert(stem.to_string(), abs_path);
+        }
+    }
+    index
+}
+
 /// Number of leading path components `path` shares with `base`, used to prefer
 /// the image closest to the note when a filename appears in multiple folders.
 fn shared_ancestor_len(path: &Path, base: Option<&Path>) -> usize {
@@ -1359,9 +1419,11 @@ impl Render for MarkdownPreviewView {
                         h_flex()
                             .pb_3()
                             .gap_2()
-                            .when_some(self.current_page_icon(cx), |this, icon| {
-                                this.child(img(icon).w(px(30.)).h(px(30.)).flex_none())
-                            })
+                            .children(
+                                self.page_icon_path
+                                    .as_ref()
+                                    .and_then(|path| markdown::svg_icon::render_svg_icon(path, px(30.))),
+                            )
                             .child(
                                 div()
                                     .text_3xl()

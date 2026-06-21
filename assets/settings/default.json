@@ -1362,6 +1362,11 @@
     // set exact paths per project in that project's .zed/settings.json.
     "wiki_paths": ["**/*wiki*"]
   },
+  // Settings for the markdown preview.
+  "markdown_preview": {
+    // How much larger than body text display math ($$…$$) is rendered.
+    "display_math_scale": 1.4
+  },
   // Whether or not to remove any trailing whitespace from lines of a buffer
   // before saving it.
   "remove_trailing_whitespace_on_save": true,

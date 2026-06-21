@@ -109,6 +109,9 @@ pub struct SettingsContent {
     /// Settings related to the markdown search (`markdown_search::Toggle`).
     pub markdown_search: Option<MarkdownSearchSettingsContent>,
 
+    /// Settings related to the markdown preview.
+    pub markdown_preview: Option<MarkdownPreviewSettingsContent>,
+
     pub git_panel: Option<GitPanelSettingsContent>,
 
     pub tabs: Option<ItemSettingsContent>,
@@ -744,6 +747,16 @@ pub struct MarkdownSearchSettingsContent {
     ///
     /// Default: ["**/*wiki*"]
     pub wiki_paths: Option<Vec<String>>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct MarkdownPreviewSettingsContent {
+    /// How much larger than the body text display math (`$$…$$`) is rendered,
+    /// since it stands alone on its own centered line.
+    ///
+    /// Default: 1.4
+    pub display_math_scale: Option<f32>,
 }
 
 #[derive(

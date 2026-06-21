@@ -1,5 +1,6 @@
 pub mod html;
 mod math;
+pub mod svg_icon;
 mod mermaid;
 pub mod parser;
 mod path_range;
@@ -26,7 +27,7 @@ use std::collections::BTreeMap;
 use std::iter;
 use std::mem;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,6 +89,15 @@ pub struct MarkdownStyle {
     pub height_is_multiple_of_line_height: bool,
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
+    /// Text style applied to table header cells. Defaults to semibold; set to a
+    /// refinement with `font_weight: None` to render headers at normal weight.
+    pub table_header_text: TextStyleRefinement,
+    /// Optional cap on the rendered height of embedded images. Aspect ratio is
+    /// preserved, so this also bounds width. `None` leaves images at their
+    /// intrinsic size (up to the container width).
+    pub image_max_height: Option<DefiniteLength>,
+    /// How much larger than body text display math (`$$…$$`) renders.
+    pub display_math_scale: f32,
 }
 
 impl Default for MarkdownStyle {
@@ -110,6 +120,12 @@ impl Default for MarkdownStyle {
             height_is_multiple_of_line_height: false,
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
+            table_header_text: TextStyleRefinement {
+                font_weight: Some(FontWeight::SEMIBOLD),
+                ..Default::default()
+            },
+            image_max_height: None,
+            display_math_scale: 1.2,
         }
     }
 }
@@ -942,6 +958,10 @@ pub struct MarkdownElement {
     on_source_click: Option<SourceClickCallback>,
     on_checkbox_toggle: Option<CheckboxToggleCallback>,
     image_resolver: Option<Box<dyn Fn(&str) -> Option<ImageSource>>>,
+    /// Given a link's destination (e.g. a wikilink page name), returns the path to
+    /// an icon SVG to show before the link when it leads a table cell or list item.
+    /// Rendered as crisp vector geometry rather than a rasterized image.
+    link_icon_resolver: Option<Box<dyn Fn(&str) -> Option<PathBuf>>>,
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
 }
@@ -959,6 +979,7 @@ impl MarkdownElement {
             on_source_click: None,
             on_checkbox_toggle: None,
             image_resolver: None,
+            link_icon_resolver: None,
             show_root_block_markers: false,
             autoscroll: AutoscrollBehavior::Propagate,
         }
@@ -1022,6 +1043,41 @@ impl MarkdownElement {
         self
     }
 
+    pub fn link_icon_resolver(
+        mut self,
+        resolver: impl Fn(&str) -> Option<PathBuf> + 'static,
+    ) -> Self {
+        self.link_icon_resolver = Some(Box::new(resolver));
+        self
+    }
+
+    /// If the cell/list-item content beginning at `start_index` leads with a link
+    /// whose destination resolves to an icon, returns that icon as a small inline
+    /// element (16px), so it can be placed before the link in the block container.
+    fn leading_link_icon(
+        &self,
+        events: &[(Range<usize>, MarkdownEvent)],
+        start_index: usize,
+    ) -> Option<AnyElement> {
+        let resolver = self.link_icon_resolver.as_ref()?;
+        for (_, event) in events.get(start_index + 1..)?.iter() {
+            match event {
+                // The block leads with a link — use its icon (or none).
+                MarkdownEvent::Start(MarkdownTag::Link { dest_url, .. }) => {
+                    let icon_path = resolver(dest_url)?;
+                    return svg_icon::render_svg_icon(&icon_path, px(16.));
+                }
+                // Skip wrappers/markers that can precede the leading link (a loose
+                // list wraps its content in a paragraph; task items emit a marker).
+                MarkdownEvent::Start(MarkdownTag::Paragraph)
+                | MarkdownEvent::TaskListMarker(_) => continue,
+                // End of the block, or any other leading content: no leading link.
+                _ => break,
+            }
+        }
+        None
+    }
+
     pub fn show_root_block_markers(mut self) -> Self {
         self.show_root_block_markers = true;
         self
@@ -1054,6 +1110,9 @@ impl MarkdownElement {
                 img(source)
                     .id(("markdown-image", range.start))
                     .max_w_full()
+                    .when_some(self.style.image_max_height, |this, max_height| {
+                        this.max_h(max_height)
+                    })
                     .when_some(height, |this, height| this.h(height))
                     .when_some(width, |this, width| this.w(width)),
             )
@@ -1170,6 +1229,7 @@ impl MarkdownElement {
         &self,
         builder: &mut MarkdownElementBuilder,
         bullet: AnyElement,
+        icon: Option<AnyElement>,
         range: &Range<usize>,
         markdown_end: usize,
         wrap_inline: bool,
@@ -1181,7 +1241,9 @@ impl MarkdownElement {
                 })
                 .h_flex()
                 .items_start()
-                .child(bullet),
+                .child(bullet)
+                // Icon (if any) sits between the bullet and the item's text.
+                .children(icon),
             range,
             markdown_end,
         );
@@ -1947,9 +2009,11 @@ impl Element for MarkdownElement {
                                     _ => {}
                                 }
                             }
+                            let icon = self.leading_link_icon(&parsed_markdown.events, index);
                             self.push_markdown_list_item(
                                 &mut builder,
                                 bullet,
+                                icon,
                                 range,
                                 markdown_end,
                                 item_has_inline_math,
@@ -2043,10 +2107,7 @@ impl Element for MarkdownElement {
                         }
                         MarkdownTag::TableHead => {
                             builder.table.start_head();
-                            builder.push_text_style(TextStyleRefinement {
-                                font_weight: Some(FontWeight::SEMIBOLD),
-                                ..Default::default()
-                            });
+                            builder.push_text_style(self.style.table_header_text.clone());
                         }
                         MarkdownTag::TableRow => {
                             builder.table.start_row();
@@ -2055,6 +2116,7 @@ impl Element for MarkdownElement {
                             let is_header = builder.table.in_head;
                             let row_index = builder.table.row_index;
                             let col_index = builder.table.col_index;
+                            let icon = self.leading_link_icon(&parsed_markdown.events, index);
 
                             builder.push_div(
                                 div()
@@ -2068,6 +2130,11 @@ impl Element for MarkdownElement {
                                     })
                                     .when(!is_header && row_index % 2 == 1, |this| {
                                         this.bg(cx.theme().colors().panel_background)
+                                    })
+                                    // A cell that leads with an iconned link becomes a
+                                    // flex row so the icon sits before the link text.
+                                    .when_some(icon, |this, icon| {
+                                        this.flex().flex_row().items_center().gap_1().child(icon)
                                     }),
                                 range,
                                 markdown_end,
@@ -2246,7 +2313,9 @@ impl Element for MarkdownElement {
                     let text_style = builder.text_style();
                     let em_px = text_style.font_size.to_pixels(window.rem_size());
                     let color = text_style.color;
-                    if let Some(element) = math::display_math(latex, em_px, color) {
+                    if let Some(element) =
+                        math::display_math(latex, em_px, color, self.style.display_math_scale)
+                    {
                         builder.push_sourced_element(range.clone(), element);
                     } else {
                         builder.push_text(latex, range.clone());

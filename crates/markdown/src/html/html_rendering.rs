@@ -160,6 +160,7 @@ impl MarkdownElement {
             self.push_markdown_list_item(
                 builder,
                 div().child(bullet).into_any_element(),
+                None,
                 &list_item.source_range,
                 markdown_end,
                 false,

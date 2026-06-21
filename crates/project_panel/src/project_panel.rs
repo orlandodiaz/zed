@@ -281,6 +281,9 @@ impl DiagnosticCount {
 struct EntryDetails {
     filename: String,
     icon: Option<SharedString>,
+    /// Path to a custom page-icon SVG (`assets/…/<name>.icon.svg`), rendered as
+    /// crisp vector geometry. Takes precedence over `icon` when present.
+    markdown_icon: Option<PathBuf>,
     path: Arc<RelPath>,
     depth: usize,
     kind: EntryKind,
@@ -5575,6 +5578,7 @@ impl ProjectPanel {
 
         let file_name = details.filename.clone();
 
+        let markdown_icon = details.markdown_icon.clone();
         let mut icon = details.icon.clone();
         if settings.file_icons && show_editor && details.kind.is_file() {
             let filename = self.filename_editor.read(cx).text(cx);
@@ -6166,7 +6170,12 @@ impl ProjectPanel {
                                 .into_any_element()
                         })
                     })
-                    .child(if let Some(icon) = &icon {
+                    .child(if let Some(markdown_icon) = &markdown_icon {
+                        // Custom page icon, rendered as crisp vector geometry.
+                        h_flex()
+                            .size(IconSize::default().rems())
+                            .children(markdown::svg_icon::render_svg_icon(markdown_icon, px(16.)))
+                    } else if let Some(icon) = &icon {
                         if let Some((_, decoration_color)) =
                             entry_diagnostic_aware_icon_decoration_and_color(diagnostic_severity)
                         {
@@ -6503,18 +6512,17 @@ impl ProjectPanel {
             )
     }
 
-    /// Absolute path of a markdown page's custom `assets/…/<name>.icon.svg`, as a
-    /// `SharedString` for `Icon::from_path` (which renders an on-disk SVG in its
-    /// own colors). `None` for non-markdown files or when no icon file exists.
+    /// Absolute path of a markdown page's custom `assets/…/<name>.icon.svg`, or
+    /// `None` for non-markdown files / when no icon file exists. Rendered as
+    /// crisp vector geometry rather than a rasterized image.
     fn markdown_page_icon(
         &self,
         worktree_id: WorktreeId,
         page_path: &RelPath,
         cx: &App,
-    ) -> Option<SharedString> {
+    ) -> Option<PathBuf> {
         let worktree = self.project.read(cx).worktree_for_id(worktree_id, cx)?;
-        let abs_path = resolve_markdown_page_icon(worktree.read(cx), page_path)?;
-        Some(SharedString::from(abs_path.to_string_lossy().into_owned()))
+        resolve_markdown_page_icon(worktree.read(cx), page_path)
     }
 
     fn details_for_entry(
@@ -6541,11 +6549,15 @@ impl ProjectPanel {
             .unwrap_or(&[]);
         let is_expanded = expanded_entry_ids.binary_search(&entry.id).is_ok();
 
+        let markdown_icon = if entry.is_file() && show_file_icons {
+            self.markdown_page_icon(worktree_id, &entry.path, cx)
+        } else {
+            None
+        };
         let icon = match entry.kind {
             EntryKind::File => {
                 if show_file_icons {
-                    self.markdown_page_icon(worktree_id, &entry.path, cx)
-                        .or_else(|| FileIcons::get_icon(entry.path.as_std_path(), cx))
+                    FileIcons::get_icon(entry.path.as_std_path(), cx)
                 } else {
                     None
                 }
@@ -6606,6 +6618,7 @@ impl ProjectPanel {
         EntryDetails {
             filename,
             icon,
+            markdown_icon,
             path: entry.path.clone(),
             depth,
             kind: entry.kind,
