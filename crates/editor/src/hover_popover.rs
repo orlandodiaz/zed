@@ -707,7 +707,7 @@ pub fn hover_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
             .text_base()
             .mt(rems(1.))
             .mb_0(),
-        table_columns_min_size: true,
+        table_size_to_content: true,
         ..Default::default()
     }
 }
@@ -761,7 +761,7 @@ pub fn diagnostics_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
             .font_weight(FontWeight::BOLD)
             .text_base()
             .mb_0(),
-        table_columns_min_size: true,
+        table_size_to_content: true,
         ..Default::default()
     }
 }

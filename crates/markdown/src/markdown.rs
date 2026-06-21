@@ -88,7 +88,9 @@ pub struct MarkdownStyle {
     pub heading_level_styles: Option<HeadingLevelStyles>,
     pub height_is_multiple_of_line_height: bool,
     pub prevent_mouse_interaction: bool,
-    pub table_columns_min_size: bool,
+    /// When true, a table shrinks to fit its content (columns sized to content,
+    /// box left-aligned) instead of stretching to the full available width.
+    pub table_size_to_content: bool,
     /// Text style applied to table header cells. Defaults to semibold; set to a
     /// refinement with `font_weight: None` to render headers at normal weight.
     pub table_header_text: TextStyleRefinement,
@@ -119,7 +121,7 @@ impl Default for MarkdownStyle {
             heading_level_styles: None,
             height_is_multiple_of_line_height: false,
             prevent_mouse_interaction: false,
-            table_columns_min_size: false,
+            table_size_to_content: false,
             table_header_text: TextStyleRefinement {
                 font_weight: Some(FontWeight::SEMIBOLD),
                 ..Default::default()
@@ -2083,27 +2085,31 @@ impl Element for MarkdownElement {
                         MarkdownTag::Table(alignments) => {
                             builder.table.start(alignments.clone());
 
-                            let column_count = alignments.len();
-                            builder.push_div(
-                                div()
-                                    .id(("table", range.start))
-                                    .grid()
-                                    .grid_cols(column_count as u16)
-                                    .when(self.style.table_columns_min_size, |this| {
-                                        this.grid_cols_min_content(column_count as u16)
-                                    })
-                                    .when(!self.style.table_columns_min_size, |this| {
-                                        this.grid_cols(column_count as u16)
-                                    })
-                                    .w_full()
-                                    .mb_2()
-                                    .border(px(1.5))
-                                    .border_color(cx.theme().colors().border)
-                                    .rounded_sm()
-                                    .overflow_hidden(),
-                                range,
-                                markdown_end,
-                            );
+                            let column_count = alignments.len() as u16;
+                            if self.style.table_size_to_content {
+                                // Full-width row that centers the content-sized table.
+                                builder.push_div(
+                                    div().w_full().flex().flex_row().justify_center(),
+                                    range,
+                                    markdown_end,
+                                );
+                            }
+                            let table = div()
+                                .id(("table", range.start))
+                                .grid()
+                                .mb_4()
+                                .border(px(1.5))
+                                .border_color(cx.theme().colors().border)
+                                .rounded_sm()
+                                .overflow_hidden();
+                            let table = if self.style.table_size_to_content {
+                                // Columns sized to content; as a flex item in the row
+                                // above, the box shrinks to fit (capped at full width).
+                                table.grid_cols_max_content(column_count).max_w_full()
+                            } else {
+                                table.grid_cols(column_count).w_full()
+                            };
+                            builder.push_div(table, range, markdown_end);
                         }
                         MarkdownTag::TableHead => {
                             builder.table.start_head();
@@ -2229,6 +2235,10 @@ impl Element for MarkdownElement {
                     }
                     MarkdownTagEnd::Table => {
                         builder.pop_div();
+                        if self.style.table_size_to_content {
+                            // Pop the centering row pushed in `MarkdownTag::Table`.
+                            builder.pop_div();
+                        }
                         builder.table.end();
                     }
                     MarkdownTagEnd::TableHead => {

@@ -209,23 +209,32 @@ impl MarkdownElement {
         let total_rows = table.header.len() + table.body.len();
         let mut grid_occupied = vec![vec![false; max_column_count]; total_rows];
 
+        if self.style.table_size_to_content {
+            // Full-width row that centers the content-sized table.
+            builder.push_div(
+                div().w_full().flex().flex_row().justify_center(),
+                &table.source_range,
+                markdown_end,
+            );
+        }
         builder.push_div(
-            div()
-                .id(("html-table", table.source_range.start))
-                .grid()
-                .grid_cols(max_column_count as u16)
-                .when(self.style.table_columns_min_size, |this| {
-                    this.grid_cols_min_content(max_column_count as u16)
-                })
-                .when(!self.style.table_columns_min_size, |this| {
-                    this.grid_cols(max_column_count as u16)
-                })
-                .w_full()
-                .mb_2()
-                .border(px(1.5))
-                .border_color(cx.theme().colors().border)
-                .rounded_sm()
-                .overflow_hidden(),
+            {
+                let table_div = div()
+                    .id(("html-table", table.source_range.start))
+                    .grid()
+                    .mb_4()
+                    .border(px(1.5))
+                    .border_color(cx.theme().colors().border)
+                    .rounded_sm()
+                    .overflow_hidden();
+                if self.style.table_size_to_content {
+                    table_div
+                        .grid_cols_max_content(max_column_count as u16)
+                        .max_w_full()
+                } else {
+                    table_div.grid_cols(max_column_count as u16).w_full()
+                }
+            },
             &table.source_range,
             markdown_end,
         );
@@ -311,6 +320,10 @@ impl MarkdownElement {
         }
 
         builder.pop_div();
+        if self.style.table_size_to_content {
+            // Pop the centering row.
+            builder.pop_div();
+        }
     }
 
     fn render_html_paragraph(

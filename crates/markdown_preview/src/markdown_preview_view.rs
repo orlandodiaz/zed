@@ -780,6 +780,8 @@ impl MarkdownPreviewView {
         markdown_style.heading.text.font_weight = Some(FontWeight::SEMIBOLD);
         // Don't bold table header cells (wiki tables of links look heavy bolded).
         markdown_style.table_header_text.font_weight = None;
+        // Size tables to their content instead of stretching to full width.
+        markdown_style.table_size_to_content = true;
         // Cap embedded images so a large-intrinsic-size SVG (e.g. a 1024px logo)
         // doesn't fill the whole preview width. Aspect ratio is preserved.
         markdown_style.image_max_height = Some(px(360.).into());
