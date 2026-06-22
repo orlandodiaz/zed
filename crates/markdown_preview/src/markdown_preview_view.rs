@@ -22,6 +22,7 @@ use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
     MarkdownOptions, MarkdownStyle,
 };
+use project::ProjectPath;
 use project::search::SearchQuery;
 use settings::Settings;
 use theme_settings::ThemeSettings;
@@ -53,6 +54,14 @@ pub struct MarkdownPreviewView {
     scroll_handle: ScrollHandle,
     image_cache: Entity<RetainAllImageCache>,
     base_directory: Option<PathBuf>,
+    /// The pane's navigation history. Owned by the preview (rather than delegated
+    /// to the backing editor) so wikilink navigation between pages forms a
+    /// browser-style back/forward stack, keyed by the file each page shows.
+    nav_history: Option<ItemNavHistory>,
+    /// The file currently shown, tracked explicitly so it's reliable even for the
+    /// in-memory editors created when navigating wikilinks (whose file isn't
+    /// always readable back off the editor).
+    current_path: Option<ProjectPath>,
     /// Obsidian-style image resolution: maps a lowercased image filename to its
     /// path anywhere in the project, so embeds like `![[hammer.svg]]` resolve
     /// even when the file lives in an `attachments/` folder rather than next to
@@ -142,8 +151,13 @@ impl MarkdownPreviewView {
                     // was the pane's preview item, make the swapped-in preview the
                     // preview item too, so markdown clicks reuse one tab.
                     let was_preview = pane.preview_item_id() == Some(editor.entity_id());
+                    // Suppress nav history while swapping: removing the editor
+                    // would otherwise push an editor entry that Back/Forward then
+                    // lands on instead of the rendered preview pages.
+                    pane.disable_history();
                     pane.remove_item(editor.entity_id(), false, false, window, cx);
                     pane.add_item(Box::new(view), true, true, Some(index), window, cx);
+                    pane.enable_history();
                     if was_preview {
                         pane.replace_preview_item_id(view_id, window, cx);
                     }
@@ -370,6 +384,8 @@ impl MarkdownPreviewView {
                 scroll_handle: ScrollHandle::new(),
                 image_cache: RetainAllImageCache::new(cx),
                 base_directory: None,
+                nav_history: None,
+                current_path: None,
                 image_index: Rc::new(HashMap::new()),
                 link_icon_index: Rc::new(HashMap::new()),
                 page_icon_path: None,
@@ -460,6 +476,7 @@ impl MarkdownPreviewView {
             editor,
             _subscription: subscription,
         });
+        self.current_path = self.path_from_active_editor(cx);
 
         self.update_markdown_from_active_editor(false, true, window, cx);
     }
@@ -634,6 +651,77 @@ impl MarkdownPreviewView {
         let project = self.workspace.upgrade()?.read(cx).project().clone();
         let worktree = project.read(cx).worktree_for_id(worktree_id, cx)?;
         resolve_markdown_page_icon(worktree.read(cx), &page_path)
+    }
+
+    /// The project path of the markdown file currently shown in the preview.
+    fn current_project_path(&self) -> Option<ProjectPath> {
+        self.current_path.clone()
+    }
+
+    /// Derive the active editor's file path (used to seed `current_path`).
+    fn path_from_active_editor(&self, cx: &App) -> Option<ProjectPath> {
+        let editor = self.active_editor.as_ref()?.editor.read(cx);
+        let file = editor.file_at(MultiBufferOffset(0), cx)?;
+        Some(ProjectPath {
+            worktree_id: file.worktree_id(cx),
+            path: file.path().clone(),
+        })
+    }
+
+    /// Navigate the preview to another markdown file in place (browser-style):
+    /// the same preview item shows the new file. When `push_history` is set, the
+    /// page being left is recorded so Back returns to it.
+    fn navigate_to_markdown(
+        &mut self,
+        project_path: ProjectPath,
+        push_history: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if push_history
+            && let Some(current) = self.current_project_path()
+            && current != project_path
+            && let Some(history) = self.nav_history.as_mut()
+        {
+            // `row` distinguishes pages: nav history dedups entries by
+            // (item, row), and this is one item, so without a per-page row every
+            // page collapses to a single entry (breaking back/forward).
+            let row = nav_row_for_path(&current);
+            history.push(Some(current), Some(row), cx);
+        }
+        // Defer everything else: `navigate()` runs while the pane is mid-navigation
+        // and this preview is mid-update, so opening the buffer / creating the
+        // editor / `set_editor` inline would nest entity updates and can abort.
+        // Running it in a spawned task does it in a clean cycle.
+        cx.spawn_in(window, async move |this, cx| {
+            let opened = this.update(cx, |this, cx| {
+                let project = this.workspace.upgrade()?.read(cx).project().clone();
+                let task =
+                    project.update(cx, |project, cx| project.open_buffer(project_path.clone(), cx));
+                Some((project, task))
+            })?;
+            let Some((project, buffer_task)) = opened else {
+                return Ok(());
+            };
+            let buffer = buffer_task.await?;
+            this.update_in(cx, |this, window, cx| {
+                let editor =
+                    cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
+                this.set_editor(editor, window, cx);
+                // Authoritative current page (the in-memory editor's file isn't
+                // always readable back, which would break forward navigation).
+                this.current_path = Some(project_path.clone());
+                // Reveal/highlight the page in the project panel. In-place nav
+                // bypasses the reveal that opening through the workspace does.
+                project.update(cx, |project, cx| {
+                    if let Some(id) = project.entry_for_path(&project_path, cx).map(|entry| entry.id)
+                    {
+                        cx.emit(project::Event::RevealInProjectPanel(id));
+                    }
+                });
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     fn line_scroll_amount(&self, cx: &App) -> Pixels {
@@ -912,6 +1000,7 @@ fn handle_url_click(
         open_preview_url(
             SharedString::from(path_part.to_string()),
             base_directory,
+            view,
             workspace,
             window,
             cx,
@@ -922,6 +1011,7 @@ fn handle_url_click(
 fn open_preview_url(
     url: SharedString,
     base_directory: Option<PathBuf>,
+    view: &WeakEntity<MarkdownPreviewView>,
     workspace: &WeakEntity<Workspace>,
     window: &mut Window,
     cx: &mut App,
@@ -948,7 +1038,7 @@ fn open_preview_url(
     // Obsidian-style wikilink: resolve `[[Name]]` to `Name.md` anywhere in the
     // project and open it.
     if let Some(workspace) = workspace.upgrade()
-        && open_wikilink_target(url.as_ref(), &workspace, window, cx)
+        && open_wikilink_target(url.as_ref(), view, &workspace, window, cx)
     {
         return;
     }
@@ -965,6 +1055,7 @@ fn open_preview_url(
 /// it. Returns false if no matching file is found.
 fn open_wikilink_target(
     name: &str,
+    view: &WeakEntity<MarkdownPreviewView>,
     workspace: &Entity<Workspace>,
     window: &mut Window,
     cx: &mut App,
@@ -994,10 +1085,15 @@ fn open_wikilink_target(
     let Some(project_path) = project_path else {
         return false;
     };
+    // Navigate the current preview in place so back/forward forms a browser-style
+    // history of pages. Falls back to opening a fresh preview if the view is gone.
+    if let Some(view) = view.upgrade() {
+        view.update(cx, |view, cx| {
+            view.navigate_to_markdown(project_path, true, window, cx);
+        });
+        return true;
+    }
     workspace.update(cx, |workspace, cx| {
-        // allow_preview = true so the target opens in the reused preview tab
-        // (and the open-as-preview swap keeps that status) instead of piling
-        // up a new permanent tab per wikilink click.
         workspace
             .open_path_preview(project_path, None, true, true, true, window, cx)
             .detach();
@@ -1180,6 +1276,17 @@ fn theme_embedded_svg(
         }
         Err(_) => source,
     }
+}
+
+/// A stable per-path pseudo-"row" so each page is a distinct nav-history entry.
+/// Nav history dedups by (item, row); the preview is a single item navigating
+/// many files, so we map the file path to a row to keep entries distinct.
+fn nav_row_for_path(path: &ProjectPath) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.worktree_id.hash(&mut hasher);
+    path.path.hash(&mut hasher);
+    hasher.finish() as u32
 }
 
 fn theme_color_hex(color: Hsla) -> String {
@@ -1411,20 +1518,22 @@ impl Item for MarkdownPreviewView {
         &mut self,
         history: ItemNavHistory,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        if let Some(state) = self.active_editor.as_ref() {
-            state
-                .editor
-                .update(cx, |editor, _| editor.set_nav_history(Some(history)));
-        }
+        // Own the history so wikilink navigation between pages forms a
+        // browser-style back/forward stack keyed by the file each page shows,
+        // rather than delegating to the (per-file) backing editor.
+        self.nav_history = Some(history);
     }
 
-    fn deactivated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(state) = self.active_editor.as_ref() {
-            state
-                .editor
-                .update(cx, |editor, cx| editor.deactivated(window, cx));
+    fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // Record the current page so Back/Forward can return to it. `row` makes
+        // each page a distinct entry (see `navigate_to_markdown`).
+        if let Some(current) = self.current_project_path()
+            && let Some(history) = self.nav_history.as_mut()
+        {
+            let row = nav_row_for_path(&current);
+            history.push(Some(current), Some(row), cx);
         }
     }
 
@@ -1434,14 +1543,14 @@ impl Item for MarkdownPreviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.active_editor
-            .as_ref()
-            .map(|state| {
-                state
-                    .editor
-                    .update(cx, |editor, cx| editor.navigate(data, window, cx))
-            })
-            .unwrap_or(false)
+        let Some(project_path) = data.downcast_ref::<ProjectPath>() else {
+            return false;
+        };
+        if self.current_project_path().as_ref() == Some(project_path) {
+            return false;
+        }
+        self.navigate_to_markdown(project_path.clone(), false, window, cx);
+        true
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
