@@ -7,10 +7,13 @@
 //! `usvg` parses the file; each `<path>` becomes a `PathBuilder` fill painted
 //! with its own color and fill rule. Geometry is cached per file path (in the
 //! SVG's own coordinate space) and rescaled to the requested size at paint time.
+//! The cache is keyed on the file's modification time so edits show up live
+//! without restarting.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::SystemTime;
 
 use gpui::{
     AnyElement, FillOptions, FillRule, Hsla, PathBuilder, PathStyle, Pixels, Rgba, canvas, point,
@@ -43,9 +46,15 @@ struct CachedIcon {
 }
 
 /// Parsing an SVG is comparatively expensive and the markdown element tree is
-/// rebuilt every frame, so cache the geometry per file path. (Icons rarely
-/// change; a file edit isn't picked up until restart.)
-static CACHE: LazyLock<Mutex<HashMap<String, Option<Arc<CachedIcon>>>>> =
+/// rebuilt every frame, so cache the parsed geometry per file path alongside the
+/// modification time it was parsed at. A cheap `stat` per lookup lets edits
+/// reload live while avoiding a re-parse on every frame.
+struct CacheEntry {
+    mtime: Option<SystemTime>,
+    icon: Option<Arc<CachedIcon>>,
+}
+
+static CACHE: LazyLock<Mutex<HashMap<String, CacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Renders the SVG at `path` as a vector element sized to fit `size` (preserving
@@ -105,15 +114,26 @@ pub fn render_svg_icon(path: &Path, size: Pixels) -> Option<AnyElement> {
 
 fn cached_icon(path: &Path) -> Option<Arc<CachedIcon>> {
     let key = path.to_string_lossy().into_owned();
+    let mtime = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
     let mut cache = CACHE.lock().ok()?;
-    if let Some(entry) = cache.get(&key) {
-        return entry.clone();
+    if let Some(entry) = cache.get(&key)
+        && entry.mtime == mtime
+    {
+        return entry.icon.clone();
     }
     let parsed = std::fs::read(path)
         .ok()
         .and_then(|bytes| parse_icon(&bytes))
         .map(Arc::new);
-    cache.insert(key, parsed.clone());
+    cache.insert(
+        key,
+        CacheEntry {
+            mtime,
+            icon: parsed.clone(),
+        },
+    );
     parsed
 }
 
