@@ -73,11 +73,12 @@ pub struct MarkdownPreviewView {
     link_icon_index: Rc<HashMap<String, PathBuf>>,
     /// Path to the current page's icon SVG, rendered as vector in the title.
     page_icon_path: Option<PathBuf>,
-    /// Rasterized embedded SVGs keyed by (file, modified-time, theme text color):
-    /// the mtime means edits to the file show without a restart (gpui's image
-    /// cache never reloads a path), and the color means `currentColor` follows the
-    /// theme — both without re-rasterizing every frame.
-    svg_theme_cache: Rc<RefCell<HashMap<(PathBuf, u64, u32), Arc<RenderImage>>>>,
+    /// Rasterized embedded SVGs keyed by (file, modified-time, theme text color,
+    /// display scale ×100): the mtime means edits show without a restart (gpui's
+    /// image cache never reloads a path), the color means `currentColor` follows
+    /// the theme, and the scale means the raster matches the display's DPI — all
+    /// without re-rasterizing every frame.
+    svg_theme_cache: Rc<RefCell<HashMap<(PathBuf, u64, u32, u32), Arc<RenderImage>>>>,
     pending_update_task: Option<Task<Result<()>>>,
     mode: MarkdownPreviewMode,
     show_footnotes: bool,
@@ -887,6 +888,7 @@ impl MarkdownPreviewView {
             let image_index = self.image_index.clone();
             let svg_renderer = cx.svg_renderer();
             let text_color = cx.theme().colors().text;
+            let scale_factor = window.scale_factor();
             let cache = self.svg_theme_cache.clone();
             move |dest_url| {
                 let source = resolve_preview_image(
@@ -895,8 +897,14 @@ impl MarkdownPreviewView {
                     workspace_directory.as_deref(),
                     &image_index,
                 )?;
-                // Make embedded SVGs that use `currentColor` follow the theme.
-                Some(theme_embedded_svg(source, text_color, &svg_renderer, &cache))
+                // Theme `currentColor` and rasterize at the display's DPI.
+                Some(theme_embedded_svg(
+                    source,
+                    text_color,
+                    scale_factor,
+                    &svg_renderer,
+                    &cache,
+                ))
             }
         })
         .link_icon_resolver({
@@ -1234,14 +1242,17 @@ fn resolve_preview_image(
 }
 
 /// Rasterizes an embedded SVG ourselves so that (a) any `currentColor` follows
-/// the theme's text color, and (b) edits to the file show without a restart —
-/// gpui's image cache is keyed by path and never reloads, so we key our own
-/// cache on the file's modified-time. Non-SVG sources pass through to `img()`.
+/// the theme's text color, (b) edits to the file show without a restart — gpui's
+/// image cache is keyed by path and never reloads, so we key our own cache on the
+/// file's modified-time — and (c) it's rasterized at the display's DPI
+/// (`scale_factor`) rather than gpui's fixed `1.0`, so it stays crisp on high-PPI
+/// screens. Non-SVG sources pass through to `img()`.
 fn theme_embedded_svg(
     source: ImageSource,
     text_color: Hsla,
+    scale_factor: f32,
     svg_renderer: &SvgRenderer,
-    cache: &RefCell<HashMap<(PathBuf, u64, u32), Arc<RenderImage>>>,
+    cache: &RefCell<HashMap<(PathBuf, u64, u32, u32), Arc<RenderImage>>>,
 ) -> ImageSource {
     let ImageSource::Resource(Resource::Path(path)) = &source else {
         return source;
@@ -1260,7 +1271,12 @@ fn theme_embedded_svg(
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|dur| dur.as_millis() as u64)
         .unwrap_or(0);
-    let cache_key = (path.to_path_buf(), mtime, theme_color_key(text_color));
+    let cache_key = (
+        path.to_path_buf(),
+        mtime,
+        theme_color_key(text_color),
+        (scale_factor * 100.0) as u32,
+    );
     if let Some(image) = cache.borrow().get(&cache_key) {
         return ImageSource::Render(image.clone());
     }
@@ -1273,7 +1289,10 @@ fn theme_embedded_svg(
     } else {
         text
     };
-    match svg_renderer.render_single_frame(themed.as_bytes(), 1.0) {
+    // Oversample to the display's scale factor so the raster is crisp at high DPI,
+    // while keeping the image's natural (layout) size equal to the SVG's intrinsic
+    // size.
+    match svg_renderer.render_oversampled(themed.as_bytes(), scale_factor) {
         Ok(image) => {
             cache.borrow_mut().insert(cache_key, image.clone());
             ImageSource::Render(image)

@@ -179,19 +179,36 @@ impl SvgRenderer {
             bytes,
             SvgSize::ScaleFactor(scale_factor * SMOOTH_SVG_SCALE_FACTOR),
         )
-        .map(|pixmap| {
-            let mut buffer =
-                image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take())
-                    .unwrap();
+        .map(|pixmap| Self::pixmap_to_render_image(pixmap, SMOOTH_SVG_SCALE_FACTOR))
+    }
 
-            for pixel in buffer.chunks_exact_mut(4) {
-                swap_rgba_pa_to_bgra(pixel);
-            }
+    /// Like [`Self::render_single_frame`] but keeps the rendered image's natural
+    /// (logical) size equal to the SVG's intrinsic size while rasterizing at
+    /// `oversample`× that size. A higher `oversample` therefore only sharpens the
+    /// result (e.g. to match a high-DPI display) without changing how large it
+    /// lays out — unlike `render_single_frame`, whose `scale_factor` also scales
+    /// the natural size.
+    pub fn render_oversampled(
+        &self,
+        bytes: &[u8],
+        oversample: f32,
+    ) -> Result<Arc<RenderImage>, usvg::Error> {
+        let pixmap_scale = oversample * SMOOTH_SVG_SCALE_FACTOR;
+        self.render_pixmap(bytes, SvgSize::ScaleFactor(pixmap_scale))
+            .map(|pixmap| Self::pixmap_to_render_image(pixmap, pixmap_scale))
+    }
 
-            let mut image = RenderImage::new(SmallVec::from_const([Frame::new(buffer)]));
-            image.scale_factor = SMOOTH_SVG_SCALE_FACTOR;
-            Arc::new(image)
-        })
+    fn pixmap_to_render_image(pixmap: Pixmap, scale_factor: f32) -> Arc<RenderImage> {
+        let mut buffer =
+            image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).unwrap();
+
+        for pixel in buffer.chunks_exact_mut(4) {
+            swap_rgba_pa_to_bgra(pixel);
+        }
+
+        let mut image = RenderImage::new(SmallVec::from_const([Frame::new(buffer)]));
+        image.scale_factor = scale_factor;
+        Arc::new(image)
     }
 
     pub(crate) fn render_alpha_mask(
