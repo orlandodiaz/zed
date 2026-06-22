@@ -6327,6 +6327,7 @@ dependencies = [
  "remote_connection",
  "serde",
  "serde_json",
+ "serde_json_lenient",
  "settings",
  "theme",
  "theme_settings",

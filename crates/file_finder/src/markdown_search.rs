@@ -63,6 +63,28 @@ fn is_wiki(matcher: &PathMatcher, path: &RelPath) -> bool {
     false
 }
 
+#[derive(serde::Deserialize)]
+struct ZedWikiPathsSettings {
+    markdown_search: Option<ZedWikiPathsBlock>,
+}
+
+#[derive(serde::Deserialize)]
+struct ZedWikiPathsBlock {
+    wiki_paths: Option<Vec<String>>,
+}
+
+/// Reads `wiki_paths` straight from a worktree's `.zed/settings.json`. Zed's
+/// settings store doesn't reliably surface this project-local setting (its
+/// project-content parser drops the nested field, and untrusted projects skip
+/// local settings entirely), so read it directly to honor a per-project scope.
+/// Falls through to the global setting when absent.
+fn worktree_wiki_paths(worktree: &project::Worktree) -> Option<Vec<String>> {
+    let path = worktree.abs_path().join(".zed/settings.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    let parsed: ZedWikiPathsSettings = serde_json_lenient::from_str(&content).ok()?;
+    parsed.markdown_search?.wiki_paths
+}
+
 pub struct MarkdownSearch {
     picker: Entity<Picker<MarkdownSearchDelegate>>,
 }
@@ -184,12 +206,6 @@ impl MarkdownSearchDelegate {
     /// Reads every `.md` file's contents and collects wiki folders into an
     /// in-memory index, then re-runs the current query against it.
     fn load_index(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        let wiki_matcher = PathMatcher::new(
-            &MarkdownSearchSettings::get_global(cx).wiki_paths,
-            PathStyle::local(),
-        )
-        .ok();
-
         let project = self.project.read(cx);
         let fs = project.fs().clone();
         let mut files: Vec<(ProjectPath, PathBuf, String)> = Vec::new();
@@ -197,6 +213,10 @@ impl MarkdownSearchDelegate {
         for worktree in project.visible_worktrees(cx) {
             let worktree = worktree.read(cx);
             let worktree_id = worktree.id();
+            // Per-project `.zed/settings.json` `wiki_paths` (read directly), else global.
+            let wiki_paths = worktree_wiki_paths(worktree)
+                .unwrap_or_else(|| MarkdownSearchSettings::get_global(cx).wiki_paths.clone());
+            let wiki_matcher = PathMatcher::new(&wiki_paths, PathStyle::local()).ok();
             // Exclude gitignored entries (e.g. node_modules).
             for entry in worktree.entries(false, 0) {
                 let project_path = ProjectPath {
@@ -225,6 +245,15 @@ impl MarkdownSearchDelegate {
                 else {
                     continue;
                 };
+                // Only index files inside a configured wiki location, so the
+                // search is scoped (e.g. just `personal_wiki/`) instead of every
+                // `.md` in the monorepo. No matcher configured -> index all.
+                if wiki_matcher
+                    .as_ref()
+                    .is_some_and(|matcher| !is_wiki(matcher, &entry.path))
+                {
+                    continue;
+                }
                 files.push((project_path, worktree.absolutize(&entry.path), title.to_string()));
             }
         }
@@ -260,6 +289,10 @@ impl MarkdownSearchDelegate {
         for worktree in self.project.read(cx).visible_worktrees(cx) {
             let worktree = worktree.read(cx);
             let worktree_id = worktree.id();
+            // Per-project `.zed/settings.json` `wiki_paths` (read directly), else global.
+            let wiki_paths = worktree_wiki_paths(worktree)
+                .unwrap_or_else(|| MarkdownSearchSettings::get_global(cx).wiki_paths.clone());
+            let wiki_matcher = PathMatcher::new(&wiki_paths, PathStyle::local()).ok();
             for entry in worktree.entries(false, 0) {
                 if !entry.is_file() {
                     continue;
@@ -273,6 +306,13 @@ impl MarkdownSearchDelegate {
                 else {
                     continue;
                 };
+                // Scope to the configured wiki location(s), matching `load_index`.
+                if wiki_matcher
+                    .as_ref()
+                    .is_some_and(|matcher| !is_wiki(matcher, &entry.path))
+                {
+                    continue;
+                }
                 let Some(pos) = title.to_ascii_lowercase().find(query_lower) else {
                     continue;
                 };
