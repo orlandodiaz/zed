@@ -57,25 +57,23 @@ struct CacheEntry {
 static CACHE: LazyLock<Mutex<HashMap<String, CacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Renders the page icon at `path` sized to fit `size`, dispatching on file type:
-/// SVGs render as resolution-independent vector geometry (crisp at any density),
-/// while raster icons (PNG/JPG/JPEG/WebP) render via `img`, which rasterizes them.
-/// Returns `None` for an SVG that can't be read or parsed.
+/// Renders the page icon at `path` sized to fit `size` by rasterizing it via
+/// `img` — which uses resvg (with system fonts) for SVGs — so every SVG feature
+/// (text, gradients, strokes, …) and raster format (PNG/JPG/JPEG/WebP) renders
+/// correctly.
+///
+/// A hand-rolled vector renderer ([`render_svg_icon`]) lives alongside this for
+/// crisp, resolution-independent rendering of simple solid-fill logos. It's
+/// currently unused — kept in case we want to route such logos through it later —
+/// because it can only draw solid fills (no text/strokes/gradients).
 pub fn render_page_icon(path: &Path, size: Pixels) -> Option<AnyElement> {
-    let is_svg = path
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"));
-    if is_svg {
-        render_svg_icon(path, size)
-    } else {
-        Some(
-            img(path.to_path_buf())
-                .object_fit(ObjectFit::Contain)
-                .size(size)
-                .flex_none()
-                .into_any_element(),
-        )
-    }
+    Some(
+        img(path.to_path_buf())
+            .object_fit(ObjectFit::Contain)
+            .size(size)
+            .flex_none()
+            .into_any_element(),
+    )
 }
 
 /// Renders the SVG at `path` as a vector element sized to fit `size` (preserving
@@ -159,6 +157,13 @@ fn cached_icon(path: &Path) -> Option<Arc<CachedIcon>> {
 }
 
 fn parse_icon(bytes: &[u8]) -> Option<CachedIcon> {
+    // usvg drops `<text>` when no fonts are loaded (we load none), so text would
+    // never appear in the parsed tree for `collect_contours` to detect — the icon
+    // would render as a textless solid shape. Sniff the raw source and bail so
+    // text-bearing SVGs rasterize via resvg, which loads system fonts.
+    if std::str::from_utf8(bytes).is_ok_and(|source| source.contains("<text")) {
+        return None;
+    }
     let tree = usvg::Tree::from_data(bytes, &usvg::Options::default()).ok()?;
     let size = tree.size();
     let (view_w, view_h) = (size.width(), size.height());
@@ -166,8 +171,9 @@ fn parse_icon(bytes: &[u8]) -> Option<CachedIcon> {
         return None;
     }
     let mut contours = Vec::new();
-    collect_contours(tree.root(), &mut contours);
-    if contours.is_empty() {
+    // Bail to the raster fallback in `render_page_icon` if the SVG uses anything
+    // this renderer can't faithfully draw, so it never renders a partial icon.
+    if !collect_contours(tree.root(), &mut contours) || contours.is_empty() {
         return None;
     }
     Some(CachedIcon {
@@ -177,18 +183,27 @@ fn parse_icon(bytes: &[u8]) -> Option<CachedIcon> {
     })
 }
 
-fn collect_contours(group: &usvg::Group, out: &mut Vec<Contour>) {
+/// Collects solid-fill path outlines into `out`. Returns `false` if the SVG uses
+/// any feature this renderer can't faithfully draw — strokes, gradient/pattern
+/// fills, `<text>`, embedded raster images — so the caller rasterizes the whole
+/// file via `img`/resvg instead of rendering it partially.
+fn collect_contours(group: &usvg::Group, out: &mut Vec<Contour>) -> bool {
     use usvg::tiny_skia_path::PathSegment;
 
     for node in group.children() {
         match node {
             usvg::Node::Path(path) => {
+                // Strokes aren't drawn by this renderer.
+                if path.stroke().is_some() {
+                    return false;
+                }
                 let Some(fill) = path.fill() else {
+                    // Neither fill nor stroke: nothing to draw, skip it.
                     continue;
                 };
                 let usvg::Paint::Color(c) = fill.paint() else {
-                    // Gradients/patterns aren't supported; skip rather than mis-fill.
-                    continue;
+                    // Gradient or pattern fill.
+                    return false;
                 };
                 let color: Hsla = Rgba {
                     r: c.red as f32 / 255.0,
@@ -243,8 +258,14 @@ fn collect_contours(group: &usvg::Group, out: &mut Vec<Contour>) {
                     });
                 }
             }
-            usvg::Node::Group(inner) => collect_contours(inner, out),
-            _ => {}
+            usvg::Node::Group(inner) => {
+                if !collect_contours(inner, out) {
+                    return false;
+                }
+            }
+            // `<text>`, embedded raster images, or anything else: unsupported.
+            _ => return false,
         }
     }
+    true
 }
