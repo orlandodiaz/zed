@@ -16,8 +16,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
 use gpui::{
-    AnyElement, FillOptions, FillRule, Hsla, PathBuilder, PathStyle, Pixels, Rgba, canvas, point,
-    prelude::*, px,
+    AnyElement, FillOptions, FillRule, Hsla, ObjectFit, PathBuilder, PathStyle, Pixels, Rgba,
+    StyledImage, canvas, img, point, prelude::*, px,
 };
 
 /// One drawing op of a path outline, in the SVG's coordinate space (the tree
@@ -56,6 +56,27 @@ struct CacheEntry {
 
 static CACHE: LazyLock<Mutex<HashMap<String, CacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Renders the page icon at `path` sized to fit `size`, dispatching on file type:
+/// SVGs render as resolution-independent vector geometry (crisp at any density),
+/// while raster icons (PNG/JPG/JPEG/WebP) render via `img`, which rasterizes them.
+/// Returns `None` for an SVG that can't be read or parsed.
+pub fn render_page_icon(path: &Path, size: Pixels) -> Option<AnyElement> {
+    let is_svg = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"));
+    if is_svg {
+        render_svg_icon(path, size)
+    } else {
+        Some(
+            img(path.to_path_buf())
+                .object_fit(ObjectFit::Contain)
+                .size(size)
+                .flex_none()
+                .into_any_element(),
+        )
+    }
+}
 
 /// Renders the SVG at `path` as a vector element sized to fit `size` (preserving
 /// aspect ratio), or `None` if it can't be read/parsed.

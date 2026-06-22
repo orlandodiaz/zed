@@ -1068,7 +1068,7 @@ impl MarkdownElement {
                 // The block leads with a link — use its icon (or none).
                 MarkdownEvent::Start(MarkdownTag::Link { dest_url, .. }) => {
                     let icon_path = resolver(dest_url)?;
-                    return svg_icon::render_svg_icon(&icon_path, px(16.));
+                    return svg_icon::render_page_icon(&icon_path, px(16.));
                 }
                 // Skip wrappers/markers that can precede the leading link (a loose
                 // list wraps its content in a paragraph; task items emit a marker).

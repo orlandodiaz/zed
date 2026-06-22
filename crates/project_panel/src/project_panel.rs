@@ -6174,7 +6174,7 @@ impl ProjectPanel {
                         // Custom page icon, rendered as crisp vector geometry.
                         h_flex()
                             .size(IconSize::default().rems())
-                            .children(markdown::svg_icon::render_svg_icon(markdown_icon, px(16.)))
+                            .children(markdown::svg_icon::render_page_icon(markdown_icon, px(16.)))
                     } else if let Some(icon) = &icon {
                         if let Some((_, decoration_color)) =
                             entry_diagnostic_aware_icon_decoration_and_color(diagnostic_severity)
@@ -7818,6 +7818,11 @@ fn entry_git_label_color(is_dir: bool, git_status: GitSummary, ignored: bool, ma
     entry_git_aware_label_color(git_status, ignored, marked)
 }
 
+/// Page icon file extensions, in preference order: SVG (crisp vector) first,
+/// then raster formats. Used both to resolve an icon and to recognize a
+/// frontmatter value that already includes an extension.
+const ICON_EXTENSIONS: &[&str] = &["svg", "png", "jpg", "jpeg", "webp"];
+
 /// Resolves an Obsidian-style custom page icon for a markdown file.
 ///
 /// A page can name a shared icon in its frontmatter (`icon: huntington`), which
@@ -7845,30 +7850,31 @@ pub fn resolve_markdown_page_icon(
     }
 
     let stem = page_path.file_stem()?;
-    let icon_file_name = format!("{stem}.icon.svg");
-    let icon_name = RelPath::unix(&icon_file_name).ok()?;
-    let assets_dir = RelPath::unix("assets").ok()?;
+    let assets_dir = RelPath::unix(".assets").ok()?;
     let parent = page_path.parent().unwrap_or(RelPath::empty());
 
+    // The `.assets` folder is hidden from the worktree (file_scan_exclusions), so
+    // probe the filesystem directly rather than going through worktree entries.
     for root in parent.ancestors() {
         let assets = root.join(assets_dir);
-        if !worktree
-            .entry_for_path(&assets)
-            .is_some_and(|entry| entry.is_dir())
-        {
-            continue;
-        }
-        // Path-mirrored: assets/<page-folder-relative-to-root>/<stem>.icon.svg
-        if let Ok(subpath) = parent.strip_prefix(root) {
-            let mirrored = assets.join(subpath).join(icon_name);
-            if worktree.entry_for_path(&mirrored).is_some() {
-                return Some(worktree.absolutize(&mirrored));
+        let mirrored_base = parent.strip_prefix(root).ok().map(|sub| assets.join(sub));
+        for extension in ICON_EXTENSIONS {
+            let file_name = format!("{stem}.icon.{extension}");
+            let Ok(icon_name) = RelPath::unix(&file_name) else {
+                continue;
+            };
+            // Path-mirrored: .assets/<page-folder-relative-to-root>/<stem>.icon.<ext>
+            if let Some(base) = &mirrored_base {
+                let mirrored = worktree.absolutize(&base.join(icon_name));
+                if mirrored.is_file() {
+                    return Some(mirrored);
+                }
             }
-        }
-        // Flat fallback: assets/<stem>.icon.svg
-        let flat = assets.join(icon_name);
-        if worktree.entry_for_path(&flat).is_some() {
-            return Some(worktree.absolutize(&flat));
+            // Flat fallback: .assets/<stem>.icon.<ext>
+            let flat = worktree.absolutize(&assets.join(icon_name));
+            if flat.is_file() {
+                return Some(flat);
+            }
         }
     }
     None
@@ -7882,34 +7888,45 @@ fn resolve_shared_page_icon(
     page_path: &RelPath,
     name: &str,
 ) -> Option<PathBuf> {
-    let assets_dir = RelPath::unix("assets").ok()?;
+    let assets_dir = RelPath::unix(".assets").ok()?;
     let parent = page_path.parent().unwrap_or(RelPath::empty());
 
-    let candidates: Vec<String> = if name.to_ascii_lowercase().ends_with(".svg") {
-        vec![name.to_string()]
-    } else {
-        vec![format!("{name}.svg"), format!("{name}.icon.svg")]
-    };
+    let candidates = shared_icon_candidates(name);
 
     for root in parent.ancestors() {
         let assets = root.join(assets_dir);
-        if !worktree
-            .entry_for_path(&assets)
-            .is_some_and(|entry| entry.is_dir())
-        {
-            continue;
-        }
         for candidate in &candidates {
             let Ok(relative) = RelPath::unix(candidate) else {
                 continue;
             };
-            let path = assets.join(relative);
-            if worktree.entry_for_path(&path).is_some() {
-                return Some(worktree.absolutize(&path));
+            let path = worktree.absolutize(&assets.join(relative));
+            if path.is_file() {
+                return Some(path);
             }
         }
     }
     None
+}
+
+/// Filenames to try for a frontmatter icon name, in preference order. A name that
+/// already carries a known extension is used verbatim; otherwise SVG is tried
+/// first, then the legacy `<name>.icon.svg`, then raster formats.
+fn shared_icon_candidates(name: &str) -> Vec<String> {
+    let lower = name.to_ascii_lowercase();
+    if ICON_EXTENSIONS
+        .iter()
+        .any(|extension| lower.ends_with(&format!(".{extension}")))
+    {
+        return vec![name.to_string()];
+    }
+    let mut candidates = vec![format!("{name}.svg"), format!("{name}.icon.svg")];
+    candidates.extend(
+        ICON_EXTENSIONS
+            .iter()
+            .filter(|extension| **extension != "svg")
+            .map(|extension| format!("{name}.{extension}")),
+    );
+    candidates
 }
 
 #[cfg(test)]
