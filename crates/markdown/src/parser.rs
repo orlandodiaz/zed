@@ -22,7 +22,10 @@ pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_SUPERSCRIPT)
     .union(Options::ENABLE_SUBSCRIPT)
     .union(Options::ENABLE_MATH)
-    .union(Options::ENABLE_WIKILINKS);
+    .union(Options::ENABLE_WIKILINKS)
+    // Recognize a leading `---` YAML frontmatter block so it's parsed as metadata
+    // (and skipped during rendering) rather than shown as a setext heading.
+    .union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
 
 #[derive(Default)]
 struct ParseState {
@@ -796,8 +799,7 @@ mod tests {
     use super::MarkdownTag::*;
     use super::*;
 
-    const UNWANTED_OPTIONS: Options =
-        Options::ENABLE_YAML_STYLE_METADATA_BLOCKS.union(Options::ENABLE_DEFINITION_LIST);
+    const UNWANTED_OPTIONS: Options = Options::ENABLE_DEFINITION_LIST;
 
     #[test]
     fn all_options_considered() {

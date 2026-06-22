@@ -1360,10 +1360,12 @@ fn build_image_index(
     index
 }
 
-/// Resolves an Obsidian-style custom page icon for a markdown file: for `Foo.md`,
-/// looks for `Foo.icon.svg` in an `assets/` folder at the page's wiki root,
-/// checking the path-mirrored `assets/<page-folder>/Foo.icon.svg` first (so
-/// same-named pages stay distinct), then a flat `assets/Foo.icon.svg`. Mirrors
+/// Resolves an Obsidian-style custom page icon for a markdown file. A page can
+/// name a shared icon in its frontmatter (`icon: huntington`) that resolves to a
+/// single `assets/huntington.svg`; otherwise it falls back to the per-page
+/// filename convention `Foo.icon.svg` in an `assets/` folder at the page's wiki
+/// root (path-mirrored `assets/<page-folder>/Foo.icon.svg` first so same-named
+/// pages stay distinct, then a flat `assets/Foo.icon.svg`). Mirrors
 /// `project_panel::resolve_markdown_page_icon` (duplicated to avoid a dependency
 /// on the project panel from the preview).
 fn resolve_markdown_page_icon(
@@ -1376,6 +1378,14 @@ fn resolve_markdown_page_icon(
     if !extension.eq_ignore_ascii_case("md") && !extension.eq_ignore_ascii_case("markdown") {
         return None;
     }
+
+    if let Some(name) =
+        markdown::page_icon::frontmatter_icon_for_file(&worktree.absolutize(page_path))
+        && let Some(icon) = resolve_shared_markdown_page_icon(worktree, page_path, &name)
+    {
+        return Some(icon);
+    }
+
     let stem = page_path.file_stem()?;
     let icon_file_name = format!("{stem}.icon.svg");
     let icon_name = RelPath::unix(&icon_file_name).ok()?;
@@ -1404,9 +1414,50 @@ fn resolve_markdown_page_icon(
     None
 }
 
-/// Index page icons by page name for wikilink resolution: every `<name>.icon.svg`
-/// under an `assets/` folder maps its lowercased `<name>` to the icon, so a
-/// wikilink `[[Name]]` can show the target page's icon.
+/// Resolves a frontmatter icon name (e.g. `huntington` or `brands/dxc`) to a
+/// shared SVG in the nearest `assets/` folder, trying `<name>.svg` then
+/// `<name>.icon.svg` (or the name verbatim when it already ends in `.svg`).
+fn resolve_shared_markdown_page_icon(
+    worktree: &project::Worktree,
+    page_path: &util::rel_path::RelPath,
+    name: &str,
+) -> Option<PathBuf> {
+    use util::rel_path::RelPath;
+
+    let assets_dir = RelPath::unix("assets").ok()?;
+    let parent = page_path.parent().unwrap_or(RelPath::empty());
+
+    let candidates: Vec<String> = if name.to_ascii_lowercase().ends_with(".svg") {
+        vec![name.to_string()]
+    } else {
+        vec![format!("{name}.svg"), format!("{name}.icon.svg")]
+    };
+
+    for root in parent.ancestors() {
+        let assets = root.join(assets_dir);
+        if !worktree
+            .entry_for_path(&assets)
+            .is_some_and(|entry| entry.is_dir())
+        {
+            continue;
+        }
+        for candidate in &candidates {
+            let Ok(relative) = RelPath::unix(candidate) else {
+                continue;
+            };
+            let path = assets.join(relative);
+            if worktree.entry_for_path(&path).is_some() {
+                return Some(worktree.absolutize(&path));
+            }
+        }
+    }
+    None
+}
+
+/// Index page icons by page name for wikilink resolution: every markdown page
+/// maps its lowercased name to its resolved icon (frontmatter `icon:` or the
+/// `<name>.icon.svg` convention), so a wikilink `[[Name]]` shows the target
+/// page's icon — including when several pages share one icon file.
 fn build_link_icon_index(
     workspace: &WeakEntity<Workspace>,
     cx: &App,
@@ -1420,23 +1471,15 @@ fn build_link_icon_index(
         let worktree = worktree.read(cx);
         // include_ignored: wiki assets are often gitignored.
         for entry in worktree.files(true, 0) {
-            let Some(file_name) = entry.path.file_name() else {
+            let Some(stem) = entry.path.file_stem() else {
                 continue;
             };
-            let lower = file_name.to_ascii_lowercase();
-            let Some(stem) = lower.strip_suffix(".icon.svg") else {
-                continue;
-            };
-            if stem.is_empty()
-                || !entry
-                    .path
-                    .ancestors()
-                    .any(|ancestor| ancestor.file_name() == Some("assets"))
-            {
+            if stem.is_empty() {
                 continue;
             }
-            let abs_path = worktree.absolutize(&entry.path);
-            index.insert(stem.to_string(), abs_path);
+            if let Some(icon) = resolve_markdown_page_icon(worktree, &entry.path) {
+                index.insert(stem.to_ascii_lowercase(), icon);
+            }
         }
     }
     index

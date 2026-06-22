@@ -7820,13 +7820,14 @@ fn entry_git_label_color(is_dir: bool, git_status: GitSummary, ignored: bool, ma
 
 /// Resolves an Obsidian-style custom page icon for a markdown file.
 ///
-/// For a note `Foo.md`, looks for `Foo.icon.svg` inside an `assets/` folder at
-/// the page's wiki root (the nearest ancestor directory that contains an
-/// `assets/` folder). The path-mirrored location is checked first so two
-/// same-named pages in different folders can have distinct icons
-/// (`assets/<page-folder>/Foo.icon.svg`), then a flat `assets/Foo.icon.svg` so
-/// uniquely-named pages need no subfolder. Returns the absolute path to the
-/// icon SVG, or `None` when no matching file exists.
+/// A page can name a shared icon in its frontmatter (`icon: huntington`), which
+/// resolves to a single `assets/huntington.svg` so many pages reuse one file. If
+/// there's no frontmatter icon, falls back to the per-page filename convention:
+/// `Foo.icon.svg` inside an `assets/` folder at the page's wiki root (the nearest
+/// ancestor directory that contains an `assets/` folder), checking the
+/// path-mirrored `assets/<page-folder>/Foo.icon.svg` first so two same-named
+/// pages in different folders stay distinct, then a flat `assets/Foo.icon.svg`.
+/// Returns the absolute path to the icon SVG, or `None` when none is found.
 pub fn resolve_markdown_page_icon(
     worktree: &worktree::Worktree,
     page_path: &RelPath,
@@ -7835,6 +7836,14 @@ pub fn resolve_markdown_page_icon(
     if !extension.eq_ignore_ascii_case("md") && !extension.eq_ignore_ascii_case("markdown") {
         return None;
     }
+
+    if let Some(name) =
+        markdown::page_icon::frontmatter_icon_for_file(&worktree.absolutize(page_path))
+        && let Some(icon) = resolve_shared_page_icon(worktree, page_path, &name)
+    {
+        return Some(icon);
+    }
+
     let stem = page_path.file_stem()?;
     let icon_file_name = format!("{stem}.icon.svg");
     let icon_name = RelPath::unix(&icon_file_name).ok()?;
@@ -7860,6 +7869,44 @@ pub fn resolve_markdown_page_icon(
         let flat = assets.join(icon_name);
         if worktree.entry_for_path(&flat).is_some() {
             return Some(worktree.absolutize(&flat));
+        }
+    }
+    None
+}
+
+/// Resolves a frontmatter icon name (e.g. `huntington` or `brands/dxc`) to a
+/// shared SVG in the nearest `assets/` folder, trying `<name>.svg` then
+/// `<name>.icon.svg` (or the name verbatim when it already ends in `.svg`).
+fn resolve_shared_page_icon(
+    worktree: &worktree::Worktree,
+    page_path: &RelPath,
+    name: &str,
+) -> Option<PathBuf> {
+    let assets_dir = RelPath::unix("assets").ok()?;
+    let parent = page_path.parent().unwrap_or(RelPath::empty());
+
+    let candidates: Vec<String> = if name.to_ascii_lowercase().ends_with(".svg") {
+        vec![name.to_string()]
+    } else {
+        vec![format!("{name}.svg"), format!("{name}.icon.svg")]
+    };
+
+    for root in parent.ancestors() {
+        let assets = root.join(assets_dir);
+        if !worktree
+            .entry_for_path(&assets)
+            .is_some_and(|entry| entry.is_dir())
+        {
+            continue;
+        }
+        for candidate in &candidates {
+            let Ok(relative) = RelPath::unix(candidate) else {
+                continue;
+            };
+            let path = assets.join(relative);
+            if worktree.entry_for_path(&path).is_some() {
+                return Some(worktree.absolutize(&path));
+            }
         }
     }
     None

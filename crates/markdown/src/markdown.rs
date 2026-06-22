@@ -1,5 +1,6 @@
 pub mod html;
 mod math;
+pub mod page_icon;
 pub mod svg_icon;
 mod mermaid;
 pub mod parser;
