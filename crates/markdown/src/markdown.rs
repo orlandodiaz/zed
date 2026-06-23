@@ -47,7 +47,7 @@ use parser::CodeBlockMetadata;
 use parser::{
     MarkdownEvent, MarkdownTag, MarkdownTagEnd, parse_links_only, parse_markdown_with_options,
 };
-use pulldown_cmark::Alignment;
+use pulldown_cmark::{Alignment, LinkType};
 use sum_tree::TreeMap;
 use theme::SyntaxTheme;
 use ui::{ScrollAxes, Scrollbars, WithScrollbar, prelude::*};
@@ -1113,8 +1113,13 @@ impl MarkdownElement {
                 img(source)
                     .id(("markdown-image", range.start))
                     .max_w_full()
-                    .when_some(self.style.image_max_height, |this, max_height| {
-                        this.max_h(max_height)
+                    // The default height cap clamps via aspect ratio, which would
+                    // override an explicit `![[img|600]]` size — so only apply it
+                    // when no explicit width/height was given.
+                    .when(width.is_none() && height.is_none(), |this| {
+                        this.when_some(self.style.image_max_height, |this, max_height| {
+                            this.max_h(max_height)
+                        })
                     })
                     .when_some(height, |this, height| this.h(height))
                     .when_some(width, |this, width| this.w(width)),
@@ -1741,15 +1746,26 @@ impl Element for MarkdownElement {
                 }
                 MarkdownEvent::Start(tag) => {
                     match tag {
-                        MarkdownTag::Image { dest_url, .. } => {
+                        MarkdownTag::Image {
+                            dest_url,
+                            link_type,
+                            ..
+                        } => {
+                            // Obsidian-style size: `![[image|600]]` / `![[image|600x400]]`.
+                            let (width, height) = image_size_override(
+                                link_type,
+                                &parsed_markdown.events,
+                                index,
+                                &parsed_markdown.source,
+                            );
                             if let Some(image) = images.get(&range.start) {
                                 current_img_block_range = Some(range.clone());
                                 self.push_markdown_image(
                                     &mut builder,
                                     range,
                                     image.clone().into(),
-                                    None,
-                                    None,
+                                    width,
+                                    height,
                                 );
                             } else if let Some(source) = self
                                 .image_resolver
@@ -1757,7 +1773,7 @@ impl Element for MarkdownElement {
                                 .and_then(|resolve| resolve(dest_url.as_ref()))
                             {
                                 current_img_block_range = Some(range.clone());
-                                self.push_markdown_image(&mut builder, range, source, None, None);
+                                self.push_markdown_image(&mut builder, range, source, width, height);
                             }
                         }
                         MarkdownTag::Paragraph => {
@@ -3234,6 +3250,48 @@ impl RenderedText {
         self.footnote_refs
             .iter()
             .find(|fref| fref.source_range.contains(&source_index))
+    }
+}
+
+/// Resolves an Obsidian-style size from a wikilink image embed: `![[image|600]]`
+/// sets the width and `![[image|600x400]]` sets width and height (in pixels). The
+/// size lives in the embed's alt text — the part after `|` — so a plain
+/// `![[image]]` (or a real caption like `![[image|Figure 1]]`) yields no override.
+/// Width-only keeps the image's aspect ratio (gpui derives the height).
+fn image_size_override(
+    link_type: &LinkType,
+    events: &[(Range<usize>, MarkdownEvent)],
+    image_index: usize,
+    source: &str,
+) -> (Option<DefiniteLength>, Option<DefiniteLength>) {
+    // Only an explicit `|...` display part (a "pothole") can carry a size.
+    if !matches!(link_type, LinkType::WikiLink { has_pothole: true }) {
+        return (None, None);
+    }
+    for (range, event) in &events[image_index + 1..] {
+        match event {
+            MarkdownEvent::Text => return parse_image_size(&source[range.clone()]),
+            MarkdownEvent::End(MarkdownTagEnd::Image) => break,
+            _ => {}
+        }
+    }
+    (None, None)
+}
+
+/// Parses `600` or `600x400` (pixels) into `(width, height)`; non-numeric text
+/// (a caption) yields `(None, None)`.
+fn parse_image_size(text: &str) -> (Option<DefiniteLength>, Option<DefiniteLength>) {
+    let pixels = |value: f32| DefiniteLength::Absolute(AbsoluteLength::Pixels(px(value)));
+    let text = text.trim();
+    if let Some((width, height)) = text.split_once(['x', 'X', '×']) {
+        match (width.trim().parse::<f32>(), height.trim().parse::<f32>()) {
+            (Ok(width), Ok(height)) => (Some(pixels(width)), Some(pixels(height))),
+            _ => (None, None),
+        }
+    } else if let Ok(width) = text.parse::<f32>() {
+        (Some(pixels(width)), None)
+    } else {
+        (None, None)
     }
 }
 
