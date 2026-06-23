@@ -877,6 +877,15 @@ impl MarkdownPreviewView {
         // Display math size is user-tunable via settings (no recompile needed).
         markdown_style.display_math_scale =
             MarkdownPreviewSettings::get_global(cx).display_math_scale;
+        // Scale the code font down a touch so monospace doesn't read larger than
+        // the proportional body text (tunable via settings, no recompile needed).
+        let code_font_scale = MarkdownPreviewSettings::get_global(cx).code_font_scale;
+        if code_font_scale != 1.0 {
+            let code_font_size =
+                ThemeSettings::get_global(cx).buffer_font_size(cx) * code_font_scale;
+            markdown_style.inline_code.font_size = Some(code_font_size.into());
+            markdown_style.code_block.text.font_size = Some(code_font_size.into());
+        }
         let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
         .code_block_renderer(CodeBlockRenderer::Default {
             copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
@@ -1379,8 +1388,73 @@ fn build_image_index(
                 }
             }
         }
+
+        // `.assets` is hidden from the worktree (file_scan_exclusions), so its
+        // images don't appear above. Find `.assets` folders via the worktree's
+        // directories and index their images from disk, so `![[image.svg]]`
+        // embeds stored there still resolve.
+        let root_assets = root.join(".assets");
+        if root_assets.is_dir() {
+            index_disk_images(&root_assets, base_directory, &mut index);
+        }
+        for entry in worktree.entries(true, 0) {
+            if !entry.is_dir() {
+                continue;
+            }
+            let assets_dir = root.join(entry.path.as_std_path()).join(".assets");
+            if assets_dir.is_dir() {
+                index_disk_images(&assets_dir, base_directory, &mut index);
+            }
+        }
     }
     index
+}
+
+/// Recursively indexes image files in `dir` (an excluded `.assets` folder) by
+/// lowercased filename, preferring the copy whose path shares the most with
+/// `base_directory` when a name appears more than once.
+fn index_disk_images(
+    dir: &Path,
+    base_directory: Option<&Path>,
+    index: &mut HashMap<String, PathBuf>,
+) {
+    use std::collections::hash_map::Entry;
+
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read_dir.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            index_disk_images(&path, base_directory, index);
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        if !IMAGE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let key = file_name.to_ascii_lowercase();
+        match index.entry(key) {
+            Entry::Occupied(mut slot) => {
+                if shared_ancestor_len(&path, base_directory)
+                    > shared_ancestor_len(slot.get(), base_directory)
+                {
+                    slot.insert(path);
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(path);
+            }
+        }
+    }
 }
 
 /// Page icon file extensions, in preference order: SVG (crisp vector) first, then

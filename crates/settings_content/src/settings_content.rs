@@ -757,6 +757,14 @@ pub struct MarkdownPreviewSettingsContent {
     ///
     /// Default: 1.4
     pub display_math_scale: Option<f32>,
+
+    /// Multiplier applied to the code (monospace) font size in the preview, for
+    /// both inline `code` and fenced code blocks. Monospace fonts read larger
+    /// than proportional body text at the same point size, so a value below 1.0
+    /// brings code visually in line with prose.
+    ///
+    /// Default: 0.85
+    pub code_font_scale: Option<f32>,
 }
 
 #[derive(
