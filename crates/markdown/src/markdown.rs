@@ -1081,6 +1081,15 @@ impl MarkdownElement {
         None
     }
 
+    /// Whether a link destination resolves to a page icon — used to decide
+    /// whether a paragraph must wrap so the icon can flow inline before the link.
+    fn link_has_icon(&self, dest_url: &str) -> bool {
+        self.link_icon_resolver
+            .as_ref()
+            .and_then(|resolver| resolver(dest_url))
+            .is_some()
+    }
+
     pub fn show_root_block_markers(mut self) -> Self {
         self.show_root_block_markers = true;
         self
@@ -1777,7 +1786,10 @@ impl Element for MarkdownElement {
                             }
                         }
                         MarkdownTag::Paragraph => {
-                            let has_inline_math = parsed_markdown.events[index + 1..]
+                            // Wrap into per-word boxes when the paragraph must flow
+                            // an inline element: inline math, or a wikilink whose
+                            // page icon is shown before it.
+                            let wrap_inline = parsed_markdown.events[index + 1..]
                                 .iter()
                                 .take_while(|(_, event)| {
                                     !matches!(
@@ -1785,13 +1797,19 @@ impl Element for MarkdownElement {
                                         MarkdownEvent::End(MarkdownTagEnd::Paragraph)
                                     )
                                 })
-                                .any(|(_, event)| matches!(event, MarkdownEvent::InlineMath(_)));
+                                .any(|(_, event)| match event {
+                                    MarkdownEvent::InlineMath(_) => true,
+                                    MarkdownEvent::Start(MarkdownTag::Link { dest_url, .. }) => {
+                                        self.link_has_icon(dest_url)
+                                    }
+                                    _ => false,
+                                });
                             self.push_markdown_paragraph(
                                 &mut builder,
                                 range,
                                 markdown_end,
                                 None,
-                                has_inline_math,
+                                wrap_inline,
                             );
                         }
                         MarkdownTag::Heading { level, .. } => {
@@ -2058,6 +2076,28 @@ impl Element for MarkdownElement {
                         MarkdownTag::Link { dest_url, .. } => {
                             if builder.code_block_stack.is_empty() {
                                 builder.push_link(dest_url.clone(), range.clone());
+                                // Show the target page's icon inline before the
+                                // link. Only in paragraphs that wrap into per-word
+                                // boxes (so it flows and the line still wraps);
+                                // leading icons in lists/tables are handled by
+                                // `leading_link_icon`.
+                                if builder.wrap_words
+                                    && let Some(resolver) = self.link_icon_resolver.as_ref()
+                                    && let Some(icon_path) = resolver(dest_url)
+                                    && let Some(icon) =
+                                        svg_icon::render_page_icon(&icon_path, px(16.))
+                                {
+                                    builder.modify_current_div(|el| {
+                                        el.child(
+                                            div()
+                                                .flex_none()
+                                                .mr_1()
+                                                .relative()
+                                                .top(px(-1.5))
+                                                .child(icon),
+                                        )
+                                    });
+                                }
                                 let style = self
                                     .style
                                     .link_callback
@@ -2818,22 +2858,34 @@ impl MarkdownElementBuilder {
     }
 
     /// Emit `text` as one `StyledText` element per word into the current
-    /// `flex_wrap` div, so it wraps between words and flows around inline math.
-    /// Trailing spaces stay attached to each word to preserve inter-word
-    /// spacing. Word-level boxes lose cross-word shaping and aren't registered
-    /// for selection — used only for paragraphs that contain inline math.
+    /// `flex_wrap` div, so it wraps between words and flows around inline elements
+    /// (math, link icons). Trailing spaces stay attached to each word to preserve
+    /// inter-word spacing. Word boxes lose cross-word shaping, but each is
+    /// registered as a `RenderedLine` so text selection still works — selection is
+    /// bounds-based (it already handles non-stacked boxes like table columns).
     fn push_wrapped_words(&mut self, text: &str, source_range: Range<usize>) {
-        self.current_source_index = source_range.end;
         let style = self.text_style();
+        let mut offset = 0;
         for word in text.split_inclusive(' ') {
             if word.is_empty() {
                 continue;
             }
-            let element = StyledText::new(word.to_string())
-                .with_runs(vec![style.to_run(word.len())])
-                .into_any();
-            self.div_stack.last_mut().unwrap().extend([element]);
+            let word_source_start = source_range.start + offset;
+            offset += word.len();
+            let styled =
+                StyledText::new(word.to_string()).with_runs(vec![style.to_run(word.len())]);
+            self.rendered_lines.push(RenderedLine {
+                layout: styled.layout().clone(),
+                source_mappings: vec![SourceMapping {
+                    rendered_index: 0,
+                    source_index: word_source_start,
+                }],
+                source_end: word_source_start + word.len(),
+                language: self.code_block_stack.last().cloned().flatten(),
+            });
+            self.div_stack.last_mut().unwrap().extend([styled.into_any()]);
         }
+        self.current_source_index = source_range.end;
     }
 
     fn push_text(&mut self, text: &str, source_range: Range<usize>) {
