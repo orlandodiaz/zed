@@ -13,7 +13,7 @@ use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
 use gpui::{
     App, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight,
-    Hsla, ImageSource, InteractiveElement, IntoElement, IsZero, Pixels, Render, RenderImage,
+    Global, Hsla, ImageSource, InteractiveElement, IntoElement, IsZero, Pixels, Render, RenderImage,
     Resource, RetainAllImageCache, Rgba, ScrollHandle, SharedString, SharedUri, Subscription,
     SvgRenderer, Task, WeakEntity, Window, point, px,
 };
@@ -22,7 +22,7 @@ use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
     MarkdownOptions, MarkdownStyle,
 };
-use project::ProjectPath;
+use project::{ProjectPath, WorktreeId};
 use project::search::SearchQuery;
 use settings::Settings;
 use theme_settings::ThemeSettings;
@@ -43,6 +43,29 @@ use crate::{
 use crate::{ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ScrollUp, ScrollUpByItem};
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Debounce before refreshing the image/page-icon indices after files change.
+/// Coalesces a burst of change events into a single rebuild.
+const INDEX_REBUILD_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// The image and page-icon indices for one worktree, cheap to clone (the maps
+/// are shared via `Rc`).
+#[derive(Clone)]
+struct WorktreeIndices {
+    images: Rc<HashMap<String, PathBuf>>,
+    link_icons: Rc<HashMap<String, PathBuf>>,
+}
+
+/// Process-wide cache of per-worktree indices, shared across every markdown
+/// preview view. Each preview file opens as its own view; without a shared cache
+/// each would rebuild the index on open. Built once per worktree (by whichever
+/// preview first needs it) and refreshed in place when that worktree's files
+/// change, so opening/switching markdown files never rebuilds on the hot path.
+#[derive(Default)]
+struct MarkdownIndexCache {
+    by_worktree: HashMap<WorktreeId, WorktreeIndices>,
+}
+
+impl Global for MarkdownIndexCache {}
 
 pub struct MarkdownPreviewView {
     workspace: WeakEntity<Workspace>,
@@ -62,15 +85,22 @@ pub struct MarkdownPreviewView {
     /// in-memory editors created when navigating wikilinks (whose file isn't
     /// always readable back off the editor).
     current_path: Option<ProjectPath>,
-    /// Obsidian-style image resolution: maps a lowercased image filename to its
-    /// path anywhere in the project, so embeds like `![[hammer.svg]]` resolve
-    /// even when the file lives in an `attachments/` folder rather than next to
-    /// the note. Rebuilt whenever the preview content updates.
+    /// This view's handle on the current worktree's shared image index (see
+    /// [`MarkdownIndexCache`]): a lowercased image filename → path, so embeds like
+    /// `![[hammer.svg]]` resolve even when the file lives in an `attachments/`
+    /// folder rather than next to the note.
     image_index: Rc<HashMap<String, PathBuf>>,
-    /// Maps a page name (the stem of `<name>.icon.svg` under an `assets/` folder)
-    /// to its icon, so a wikilink leading a table cell or list item can show the
-    /// target page's icon. Rebuilt whenever the preview content updates.
+    /// This view's handle on the current worktree's shared page-icon index: a
+    /// page name → its icon, so a wikilink can show the target page's icon.
     link_icon_index: Rc<HashMap<String, PathBuf>>,
+    /// The worktree `image_index`/`link_icon_index` currently point at. Switching
+    /// to a file in a different worktree re-points them (from the shared cache).
+    indexed_worktree: Option<WorktreeId>,
+    /// Debounced index (re)build task. Kept so the latest schedule replaces the
+    /// previous one, collapsing a burst of change events into one rebuild.
+    index_rebuild_task: Option<Task<()>>,
+    /// Keeps the project worktree-change subscription alive for this view.
+    _project_subscription: Option<Subscription>,
     /// Path to the current page's icon SVG, rendered as vector in the title.
     page_icon_path: Option<PathBuf>,
     /// Rasterized embedded SVGs keyed by (file, modified-time, theme text color,
@@ -389,6 +419,9 @@ impl MarkdownPreviewView {
                 current_path: None,
                 image_index: Rc::new(HashMap::new()),
                 link_icon_index: Rc::new(HashMap::new()),
+                indexed_worktree: None,
+                index_rebuild_task: None,
+                _project_subscription: None,
                 page_icon_path: None,
                 svg_theme_cache: Rc::new(RefCell::new(HashMap::new())),
                 pending_update_task: None,
@@ -555,12 +588,7 @@ impl MarkdownPreviewView {
                     view.markdown.update(cx, |markdown, cx| {
                         markdown.reset(contents, cx);
                     });
-                    view.image_index = Rc::new(build_image_index(
-                        &view.workspace,
-                        view.base_directory.as_deref(),
-                        cx,
-                    ));
-                    view.link_icon_index = Rc::new(build_link_icon_index(&view.workspace, cx));
+                    view.refresh_indices(cx);
                     view.page_icon_path = view.current_page_icon(cx);
                     view.sync_preview_to_source_index(selection_start, should_reveal_selection, cx);
                     cx.emit(SearchEvent::MatchesInvalidated);
@@ -569,6 +597,114 @@ impl MarkdownPreviewView {
                 cx.notify();
             })
         })
+    }
+
+    /// Ensure the image/page-icon indices are current for the previewed file's
+    /// worktree — never on the switch/render path itself. Switching between files
+    /// in an already-indexed worktree does nothing here; only a worktree change
+    /// or a relevant file change triggers a (debounced, off-path) rebuild. This
+    /// is what keeps switching instant even in million-file monorepos: the walk
+    /// runs once per worktree, not on every switch.
+    fn refresh_indices(&mut self, cx: &mut Context<Self>) {
+        self.ensure_project_subscription(cx);
+        let Some(worktree_id) = self.current_path.as_ref().map(|path| path.worktree_id) else {
+            return;
+        };
+        if self.indexed_worktree == Some(worktree_id) {
+            return;
+        }
+        // Reuse the shared, cross-view index if some preview already built it for
+        // this worktree; otherwise build it once now (cheap for vault-sized trees)
+        // and store it for every other preview to reuse. This is what keeps
+        // opening/switching markdown files instant — the walk happens once per
+        // worktree, not once per file.
+        let indices = match cx
+            .try_global::<MarkdownIndexCache>()
+            .and_then(|cache| cache.by_worktree.get(&worktree_id).cloned())
+        {
+            Some(indices) => indices,
+            None => self.build_and_cache_indices(worktree_id, cx),
+        };
+        self.image_index = indices.images;
+        self.link_icon_index = indices.link_icons;
+        self.indexed_worktree = Some(worktree_id);
+    }
+
+    /// Build the indices for `worktree_id` and store them in the shared cache.
+    /// Built base-independent (no nearest-note tie-break) so the same index is
+    /// reusable by every preview regardless of which note is open.
+    fn build_and_cache_indices(
+        &self,
+        worktree_id: WorktreeId,
+        cx: &mut Context<Self>,
+    ) -> WorktreeIndices {
+        let indices = WorktreeIndices {
+            images: Rc::new(build_image_index(&self.workspace, Some(worktree_id), None, cx)),
+            link_icons: Rc::new(build_link_icon_index(&self.workspace, Some(worktree_id), cx)),
+        };
+        cx.default_global::<MarkdownIndexCache>()
+            .by_worktree
+            .insert(worktree_id, indices.clone());
+        indices
+    }
+
+    /// Refresh the current worktree's shared index after a short debounce, off
+    /// the render path. The stale index stays in use (and shown) until this
+    /// completes, so icons never disappear and switches never block on it.
+    fn schedule_index_rebuild(&mut self, cx: &mut Context<Self>) {
+        let Some(worktree_id) = self.current_path.as_ref().map(|path| path.worktree_id) else {
+            return;
+        };
+        self.index_rebuild_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(INDEX_REBUILD_DEBOUNCE)
+                .await;
+            this.update(cx, |this, cx| {
+                let indices = this.build_and_cache_indices(worktree_id, cx);
+                this.image_index = indices.images;
+                this.link_icon_index = indices.link_icons;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Subscribe (once) to the project so worktree changes mark the icon/image
+    /// indices stale. Done lazily here rather than in `new` because `new` runs
+    /// inside a workspace update (the editor→preview swap), where reading the
+    /// workspace to reach the project would double-lease it and panic. This runs
+    /// from the deferred update task, where reading the workspace is safe.
+    fn ensure_project_subscription(&mut self, cx: &mut Context<Self>) {
+        if self._project_subscription.is_some() {
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        self._project_subscription =
+            Some(cx.subscribe(&project, |this, _project, event, cx| {
+                let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event else {
+                    return;
+                };
+                // Only refresh when the previewed file's own worktree changes, and
+                // only for markdown/image/icon files — not unrelated edits.
+                let current = this.current_path.as_ref().map(|path| path.worktree_id);
+                if current != Some(*worktree_id) {
+                    return;
+                }
+                let relevant = changes.iter().any(|(path, _, _)| {
+                    path.extension().is_some_and(|extension| {
+                        let extension = extension.to_ascii_lowercase();
+                        extension == "md"
+                            || extension == "markdown"
+                            || IMAGE_EXTENSIONS.contains(&extension.as_str())
+                    })
+                });
+                if relevant {
+                    this.schedule_index_rebuild(cx);
+                }
+            }));
     }
 
     fn selected_source_index(editor: &Editor, cx: &mut App) -> usize {
@@ -879,12 +1015,23 @@ impl MarkdownPreviewView {
             MarkdownPreviewSettings::get_global(cx).display_math_scale;
         // Scale the code font down a touch so monospace doesn't read larger than
         // the proportional body text (tunable via settings, no recompile needed).
-        let code_font_scale = MarkdownPreviewSettings::get_global(cx).code_font_scale;
-        if code_font_scale != 1.0 {
-            let code_font_size =
-                ThemeSettings::get_global(cx).buffer_font_size(cx) * code_font_scale;
-            markdown_style.inline_code.font_size = Some(code_font_size.into());
-            markdown_style.code_block.text.font_size = Some(code_font_size.into());
+        let preview_settings = MarkdownPreviewSettings::get_global(cx);
+        let buffer_font_size = ThemeSettings::get_global(cx).buffer_font_size(cx);
+        if preview_settings.code_font_scale != 1.0 {
+            markdown_style.code_block.text.font_size =
+                Some((buffer_font_size * preview_settings.code_font_scale).into());
+        }
+        // Render inline code as its own sized box so it can be smaller than the
+        // body text — a shaped line is otherwise locked to a single size, which
+        // forces inline code up to the (larger) body size.
+        markdown_style.inline_code_box = true;
+        markdown_style.inline_code.font_size =
+            Some((buffer_font_size * preview_settings.inline_code_font_scale).into());
+        if let Some(background) = preview_settings.inline_code_background {
+            markdown_style.inline_code.background_color = Some(background);
+        }
+        if let Some(color) = preview_settings.inline_code_color {
+            markdown_style.inline_code.color = Some(color);
         }
         let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
         .code_block_renderer(CodeBlockRenderer::Default {
@@ -1344,11 +1491,13 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "avif", "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "tga", "bmp", "ico", "svg",
 ];
 
+
 /// Index every image file in the project by its lowercased filename so embeds
 /// can be resolved by name alone, like an Obsidian vault. On a filename
 /// collision, the file sharing the most path components with the note wins.
 fn build_image_index(
     workspace: &WeakEntity<Workspace>,
+    worktree_id: Option<WorktreeId>,
     base_directory: Option<&Path>,
     cx: &App,
 ) -> HashMap<String, PathBuf> {
@@ -1361,6 +1510,12 @@ fn build_image_index(
     let project = workspace.read(cx).project().read(cx);
     for worktree in project.worktrees(cx) {
         let worktree = worktree.read(cx);
+        // Scope to the previewed file's worktree. Walking every open worktree can
+        // mean iterating millions of entries (e.g. a large sibling repo) on each
+        // rebuild; the wiki's images live in its own worktree.
+        if worktree_id.is_some_and(|id| worktree.id() != id) {
+            continue;
+        }
         let root = worktree.abs_path();
         // include_ignored: wiki attachments are often gitignored.
         for entry in worktree.files(true, 0) {
@@ -1574,6 +1729,7 @@ fn shared_icon_candidates(name: &str) -> Vec<String> {
 /// page's icon — including when several pages share one icon file.
 fn build_link_icon_index(
     workspace: &WeakEntity<Workspace>,
+    worktree_id: Option<WorktreeId>,
     cx: &App,
 ) -> HashMap<String, PathBuf> {
     let mut index: HashMap<String, PathBuf> = HashMap::new();
@@ -1583,6 +1739,12 @@ fn build_link_icon_index(
     let project = workspace.read(cx).project().read(cx);
     for worktree in project.worktrees(cx) {
         let worktree = worktree.read(cx);
+        // Scope to the previewed file's worktree (see `build_image_index`): the
+        // per-page icon search across an unrelated million-file repo is the most
+        // expensive walk of all.
+        if worktree_id.is_some_and(|id| worktree.id() != id) {
+            continue;
+        }
         // include_ignored: wiki assets are often gitignored.
         for entry in worktree.files(true, 0) {
             let Some(stem) = entry.path.file_stem() else {

@@ -758,13 +758,29 @@ pub struct MarkdownPreviewSettingsContent {
     /// Default: 1.4
     pub display_math_scale: Option<f32>,
 
-    /// Multiplier applied to the code (monospace) font size in the preview, for
-    /// both inline `code` and fenced code blocks. Monospace fonts read larger
-    /// than proportional body text at the same point size, so a value below 1.0
-    /// brings code visually in line with prose.
+    /// Multiplier applied to the monospace font size of fenced code blocks in
+    /// the preview. Monospace fonts read larger than proportional body text at
+    /// the same point size, so a value below 1.0 brings blocks in line with
+    /// prose. (Inline code is controlled separately by `inline_code_font_scale`.)
     ///
     /// Default: 0.85
     pub code_font_scale: Option<f32>,
+
+    /// Multiplier applied to the monospace font size of inline `code` spans in
+    /// the preview, relative to the editor buffer font size. Inline code is
+    /// rendered as its own box so this can differ from the body text size; a
+    /// value below 1.0 makes inline code smaller than surrounding prose.
+    ///
+    /// Default: 1.0
+    pub inline_code_font_scale: Option<f32>,
+
+    /// Background color of inline `code` chips in the preview, as `#rrggbb` or
+    /// `#rrggbbaa`. When unset, a subtle tint of the editor foreground is used.
+    pub inline_code_background: Option<gpui::Rgba>,
+
+    /// Text color of inline `code` in the preview, as `#rrggbb` or `#rrggbbaa`.
+    /// When unset, inline code uses the surrounding text color.
+    pub inline_code_color: Option<gpui::Rgba>,
 }
 
 #[derive(
