@@ -101,6 +101,13 @@ pub struct MarkdownStyle {
     pub image_max_height: Option<DefiniteLength>,
     /// How much larger than body text display math (`$$…$$`) renders.
     pub display_math_scale: f32,
+    /// When true, inline code (`` `code` ``) is rendered as its own sized box so
+    /// it can use `inline_code.font_size` independently of the surrounding line
+    /// (a shaped `StyledText` line is locked to a single size, so the run-level
+    /// `font_size` is otherwise ignored). Lines containing inline code then flow
+    /// as per-word boxes, like inline math. Off by default; the markdown preview
+    /// opts in.
+    pub inline_code_box: bool,
 }
 
 impl Default for MarkdownStyle {
@@ -129,6 +136,7 @@ impl Default for MarkdownStyle {
             },
             image_max_height: None,
             display_math_scale: 1.2,
+            inline_code_box: false,
         }
     }
 }
@@ -1799,6 +1807,7 @@ impl Element for MarkdownElement {
                                 })
                                 .any(|(_, event)| match event {
                                     MarkdownEvent::InlineMath(_) => true,
+                                    MarkdownEvent::Code => self.style.inline_code_box,
                                     MarkdownEvent::Start(MarkdownTag::Link { dest_url, .. }) => {
                                         self.link_has_icon(dest_url)
                                     }
@@ -2025,11 +2034,12 @@ impl Element for MarkdownElement {
                                             .into_any_element(),
                                     }
                                 };
-                            // Detect inline math directly in this item (tight
-                            // list), excluding math nested in a child block like
-                            // a paragraph or sublist (those handle their own
-                            // wrapping). Only direct inline math needs the item's
-                            // content row to become a wrapping flex row.
+                            // Detect inline math (or, when `inline_code_box` is
+                            // on, inline code) directly in this item (tight list),
+                            // excluding any nested in a child block like a
+                            // paragraph or sublist (those handle their own
+                            // wrapping). Only direct inline elements need the
+                            // item's content row to become a wrapping flex row.
                             let mut depth = 0usize;
                             let mut item_has_inline_math = false;
                             for (_, event) in &parsed_markdown.events[index + 1..] {
@@ -2038,6 +2048,31 @@ impl Element for MarkdownElement {
                                         item_has_inline_math = true;
                                         break;
                                     }
+                                    MarkdownEvent::Code
+                                        if depth == 0 && self.style.inline_code_box =>
+                                    {
+                                        item_has_inline_math = true;
+                                        break;
+                                    }
+                                    // Inline formatting (bold/italic/strikethrough/
+                                    // links) is transparent here: code or math wrapped
+                                    // in it still belongs to the item's own line. Only
+                                    // child *blocks* (sub-paragraph, sublist) increase
+                                    // depth and so are skipped.
+                                    MarkdownEvent::Start(
+                                        MarkdownTag::Emphasis
+                                        | MarkdownTag::Strong
+                                        | MarkdownTag::Strikethrough
+                                        | MarkdownTag::Link { .. }
+                                        | MarkdownTag::Image { .. },
+                                    )
+                                    | MarkdownEvent::End(
+                                        MarkdownTagEnd::Emphasis
+                                        | MarkdownTagEnd::Strong
+                                        | MarkdownTagEnd::Strikethrough
+                                        | MarkdownTagEnd::Link
+                                        | MarkdownTagEnd::Image,
+                                    ) => {}
                                     MarkdownEvent::Start(_) => depth += 1,
                                     MarkdownEvent::End(MarkdownTagEnd::Item) if depth == 0 => {
                                         break;
@@ -2046,7 +2081,13 @@ impl Element for MarkdownElement {
                                     _ => {}
                                 }
                             }
-                            let icon = self.leading_link_icon(&parsed_markdown.events, index);
+                            // A wrapping item injects its leading link's icon inline
+                            // (via the link handler), so don't also place it here.
+                            let icon = if item_has_inline_math {
+                                None
+                            } else {
+                                self.leading_link_icon(&parsed_markdown.events, index)
+                            };
                             self.push_markdown_list_item(
                                 &mut builder,
                                 bullet,
@@ -2179,7 +2220,29 @@ impl Element for MarkdownElement {
                             let is_header = builder.table.in_head;
                             let row_index = builder.table.row_index;
                             let col_index = builder.table.col_index;
-                            let icon = self.leading_link_icon(&parsed_markdown.events, index);
+                            // A cell whose content includes inline code (when boxed)
+                            // or inline math must wrap into per-word boxes so those
+                            // elements flow inline and take their own size.
+                            let cell_wraps = parsed_markdown.events[index + 1..]
+                                .iter()
+                                .take_while(|(_, event)| {
+                                    !matches!(
+                                        event,
+                                        MarkdownEvent::End(MarkdownTagEnd::TableCell)
+                                    )
+                                })
+                                .any(|(_, event)| match event {
+                                    MarkdownEvent::InlineMath(_) => true,
+                                    MarkdownEvent::Code => self.style.inline_code_box,
+                                    _ => false,
+                                });
+                            // A wrapping cell injects its leading link's icon inline
+                            // (via the link handler), so don't also place it here.
+                            let icon = if cell_wraps {
+                                None
+                            } else {
+                                self.leading_link_icon(&parsed_markdown.events, index)
+                            };
 
                             builder.push_div(
                                 div()
@@ -2194,6 +2257,9 @@ impl Element for MarkdownElement {
                                     .when(!is_header && row_index % 2 == 1, |this| {
                                         this.bg(cx.theme().colors().panel_background)
                                     })
+                                    .when(cell_wraps, |this| {
+                                        this.flex().flex_row().flex_wrap().items_baseline()
+                                    })
                                     // A cell that leads with an iconned link becomes a
                                     // flex row so the icon sits before the link text.
                                     .when_some(icon, |this, icon| {
@@ -2202,6 +2268,7 @@ impl Element for MarkdownElement {
                                 range,
                                 markdown_end,
                             );
+                            builder.wrap_words = cell_wraps;
                         }
                         _ => log::debug!("unsupported markdown tag {:?}", tag),
                     }
@@ -2307,6 +2374,7 @@ impl Element for MarkdownElement {
                     }
                     MarkdownTagEnd::TableCell => {
                         builder.replace_pending_checkbox(range);
+                        builder.wrap_words = false;
                         builder.pop_div();
                         builder.table.end_cell();
                     }
@@ -2324,9 +2392,20 @@ impl Element for MarkdownElement {
                     builder.push_text(text, range.clone());
                 }
                 MarkdownEvent::Code => {
-                    builder.push_text_style(self.style.inline_code.clone());
-                    builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
-                    builder.pop_text_style();
+                    // In a wrapping (per-word) line, render inline code as its own
+                    // box so it can take `inline_code.font_size` — a shaped line is
+                    // locked to one size, so the run-level size is otherwise lost.
+                    if builder.wrap_words && self.style.inline_code_box {
+                        builder.push_inline_code_box(
+                            &parsed_markdown.source[range.clone()],
+                            range.clone(),
+                            &self.style.inline_code,
+                        );
+                    } else {
+                        builder.push_text_style(self.style.inline_code.clone());
+                        builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                        builder.pop_text_style();
+                    }
                 }
                 MarkdownEvent::Html => {
                     let html = &parsed_markdown.source[range.clone()];
@@ -2886,6 +2965,47 @@ impl MarkdownElementBuilder {
             self.div_stack.last_mut().unwrap().extend([styled.into_any()]);
         }
         self.current_source_index = source_range.end;
+    }
+
+    /// Emit one inline-code span as a single sized box into the current
+    /// `flex_wrap` div. The box owns its `text_size` (from `code_style`), so
+    /// inline code can render at a different point size than the surrounding
+    /// line — impossible within a single shaped `StyledText`, whose runs carry
+    /// no size. The chip background moves from the run to the box; the span is
+    /// registered as one `RenderedLine` so selection (bounds-based) still works.
+    fn push_inline_code_box(
+        &mut self,
+        text: &str,
+        source_range: Range<usize>,
+        code_style: &TextStyleRefinement,
+    ) {
+        let mut run_style = self.text_style();
+        run_style.refine(code_style);
+        // The box paints the chip background; don't also paint it on the run.
+        run_style.background_color = None;
+        let styled =
+            StyledText::new(text.to_string()).with_runs(vec![run_style.to_run(text.len())]);
+        self.rendered_lines.push(RenderedLine {
+            layout: styled.layout().clone(),
+            source_mappings: vec![SourceMapping {
+                rendered_index: 0,
+                source_index: source_range.start,
+            }],
+            source_end: source_range.end,
+            language: None,
+        });
+        let chip = div()
+            .flex_none()
+            .px(px(3.))
+            .rounded_sm()
+            .when_some(code_style.font_size, |el, size| el.text_size(size))
+            .when_some(code_style.background_color, |el, bg| el.bg(bg))
+            .child(styled);
+        self.current_source_index = source_range.end;
+        self.div_stack
+            .last_mut()
+            .unwrap()
+            .extend([chip.into_any_element()]);
     }
 
     fn push_text(&mut self, text: &str, source_range: Range<usize>) {
