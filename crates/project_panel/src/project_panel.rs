@@ -50,7 +50,7 @@ use settings::{
 use smallvec::SmallVec;
 use std::{
     any::TypeId,
-    cell::OnceCell,
+    cell::{OnceCell, RefCell},
     cmp,
     collections::HashSet,
     ops::Neg,
@@ -154,6 +154,11 @@ pub struct ProjectPanel {
     workspace: WeakEntity<Workspace>,
     diagnostics: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticSeverity>,
     diagnostic_counts: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticCount>,
+    // Memoized markdown page-icon resolution. `resolve_markdown_page_icon` does
+    // many filesystem stats; without this it re-runs for every visible row on
+    // every render frame (noticeable lag when switching files). Cleared whenever
+    // the visible entry list is rebuilt (`update_visible_entries`).
+    markdown_icon_cache: RefCell<HashMap<(WorktreeId, Arc<RelPath>), Option<PathBuf>>>,
     diagnostic_summary_update: Task<()>,
     // Per-worktree manual ordering of entries (drag/move-to-reorder), loaded
     // from and persisted to `<worktree-root>/.zed/panel-order.json`.
@@ -751,7 +756,7 @@ impl ProjectPanel {
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
                     }
-                    project::Event::WorktreeUpdatedEntries(_, changes) => {
+                    project::Event::WorktreeUpdatedEntries(worktree_id, changes) => {
                         // Reload manual ordering when a `.order` file appears or
                         // changes (e.g. edited by an external tool or an agent),
                         // so the panel reflects it without a restart.
@@ -759,6 +764,14 @@ impl ProjectPanel {
                             path.file_name() == Some(manual_order::ORDER_FILE_NAME)
                         }) {
                             this.load_manual_orders(window, cx);
+                        }
+                        // A changed page's frontmatter icon may differ now; drop only
+                        // the memoized resolutions for the paths that changed (saving
+                        // a file must not force re-resolving every visible row, which
+                        // would re-stat the disk for the whole panel).
+                        let icon_cache = this.markdown_icon_cache.get_mut();
+                        for (path, _, _) in changes.iter() {
+                            icon_cache.remove(&(*worktree_id, path.clone()));
                         }
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
@@ -915,6 +928,7 @@ impl ProjectPanel {
                 workspace: workspace.weak_handle(),
                 diagnostics: Default::default(),
                 diagnostic_counts: Default::default(),
+                markdown_icon_cache: Default::default(),
                 diagnostic_summary_update: Task::ready(()),
                 manual_orders: Default::default(),
                 scroll_handle,
@@ -6518,11 +6532,23 @@ impl ProjectPanel {
     fn markdown_page_icon(
         &self,
         worktree_id: WorktreeId,
-        page_path: &RelPath,
+        page_path: &Arc<RelPath>,
         cx: &App,
     ) -> Option<PathBuf> {
-        let worktree = self.project.read(cx).worktree_for_id(worktree_id, cx)?;
-        resolve_markdown_page_icon(worktree.read(cx), page_path)
+        let key = (worktree_id, page_path.clone());
+        let cached = self.markdown_icon_cache.borrow().get(&key).cloned();
+        if let Some(cached) = cached {
+            return cached;
+        }
+        let resolved = self
+            .project
+            .read(cx)
+            .worktree_for_id(worktree_id, cx)
+            .and_then(|worktree| resolve_markdown_page_icon(worktree.read(cx), page_path));
+        self.markdown_icon_cache
+            .borrow_mut()
+            .insert(key, resolved.clone());
+        resolved
     }
 
     fn details_for_entry(
