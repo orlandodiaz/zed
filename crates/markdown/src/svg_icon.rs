@@ -17,7 +17,7 @@ use std::time::SystemTime;
 
 use gpui::{
     AnyElement, FillOptions, FillRule, Hsla, ObjectFit, PathBuilder, PathStyle, Pixels, Rgba,
-    StyledImage, canvas, img, point, prelude::*, px,
+    StyledImage, canvas, div, img, point, prelude::*, px,
 };
 
 /// One drawing op of a path outline, in the SVG's coordinate space (the tree
@@ -67,11 +67,27 @@ static CACHE: LazyLock<Mutex<HashMap<String, CacheEntry>>> =
 /// currently unused — kept in case we want to route such logos through it later —
 /// because it can only draw solid fills (no text/strokes/gradients).
 pub fn render_page_icon(path: &Path, size: Pixels) -> Option<AnyElement> {
+    // Once an image loads, gpui sets its `aspect_ratio` from the file's intrinsic
+    // dimensions (img.rs). Inside a flex row (e.g. an inline link icon flowing in
+    // a baseline-aligned paragraph) taffy honors that ratio over the explicit
+    // size, blowing up a tall-aspect SVG. Absolutely positioning the image takes
+    // it out of flex flow, so the fixed-size, aspect-ratio-free outer box (a
+    // plain flex item) decides the layout; the image fills it and `object_fit`
+    // scales the glyph to fit. `overflow_hidden` is a backstop.
     Some(
-        img(path.to_path_buf())
-            .object_fit(ObjectFit::Contain)
-            .size(size)
+        div()
             .flex_none()
+            .size(size)
+            .relative()
+            .overflow_hidden()
+            .child(
+                img(path.to_path_buf())
+                    .object_fit(ObjectFit::Contain)
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+            )
             .into_any_element(),
     )
 }
