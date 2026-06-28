@@ -22,7 +22,7 @@ use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
     MarkdownOptions, MarkdownStyle,
 };
-use project::{ProjectPath, WorktreeId};
+use project::{PathChange, ProjectPath, WorktreeId};
 use project::search::SearchQuery;
 use settings::Settings;
 use theme_settings::ThemeSettings;
@@ -687,14 +687,20 @@ impl MarkdownPreviewView {
                 let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event else {
                     return;
                 };
-                // Only refresh when the previewed file's own worktree changes, and
-                // only for markdown/image/icon files — not unrelated edits.
+                // Only refresh when the previewed file's own worktree changes.
                 let current = this.current_path.as_ref().map(|path| path.worktree_id);
                 if current != Some(*worktree_id) {
                     return;
                 }
-                let relevant = changes.iter().any(|(path, _, _)| {
-                    path.extension().is_some_and(|extension| {
+                // Rebuild only for *structural* changes to markdown/image files —
+                // a file added, removed, or renamed. A plain content `Updated`
+                // (e.g. autosave while editing a page's body) can't change the
+                // index, so it must not trigger a worktree walk on every save.
+                let relevant = changes.iter().any(|(path, _, change)| {
+                    matches!(
+                        change,
+                        PathChange::Added | PathChange::Removed | PathChange::AddedOrUpdated
+                    ) && path.extension().is_some_and(|extension| {
                         let extension = extension.to_ascii_lowercase();
                         extension == "md"
                             || extension == "markdown"
