@@ -150,6 +150,11 @@ pub enum TemplateColumnMinSize {
     MinContent,
     /// The column size can be determined by the max content
     MaxContent,
+    /// CSS `auto` tracks: min-content floor, max-content preferred — sizes
+    /// columns to their content like an HTML table, and never below the
+    /// content's minimum (which `minmax(0, max-content)` tracks allow,
+    /// clipping cells when the container is squeezed).
+    Auto,
 }
 
 /// A simplified representation of the grid-template-* value

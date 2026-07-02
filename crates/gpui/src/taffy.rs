@@ -333,6 +333,13 @@ impl ToTaffy<taffy::style::Style> for Style {
                             vec![minmax(length(0.0_f32), max_content())],
                         )]
                     }
+                    // grid-template-*: repeat(<number>, minmax(min-content, max-content))
+                    crate::TemplateColumnMinSize::Auto => {
+                        vec![repeat(
+                            template.repeat,
+                            vec![minmax(min_content(), max_content())],
+                        )]
+                    }
                 }
             })
             .unwrap_or_default()

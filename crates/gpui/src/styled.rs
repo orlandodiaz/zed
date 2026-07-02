@@ -744,6 +744,18 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the grid columns to `auto` tracks (min-content floor, max-content
+    /// preferred), sizing each column to its content like an HTML table. Unlike
+    /// `grid_cols_max_content`, columns never shrink below their content's
+    /// minimum, so cells wrap instead of clipping when space is constrained.
+    fn grid_cols_auto(mut self, cols: u16) -> Self {
+        self.style().grid_cols = Some(GridTemplate {
+            repeat: cols,
+            min_size: TemplateColumnMinSize::Auto,
+        });
+        self
+    }
+
     /// Sets the grid rows of this element.
     fn grid_rows(mut self, rows: u16) -> Self {
         self.style().grid_rows = Some(GridTemplate {

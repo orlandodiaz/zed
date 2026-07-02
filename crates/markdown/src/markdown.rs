@@ -265,6 +265,7 @@ pub struct Markdown {
     mermaid_state: MermaidState,
     copied_code_blocks: HashSet<ElementId>,
     code_block_scroll_handles: BTreeMap<usize, ScrollHandle>,
+    table_scroll_handles: BTreeMap<usize, ScrollHandle>,
     context_menu_link: Option<SharedString>,
     context_menu_selected_text: Option<String>,
     search_highlights: Vec<Range<usize>>,
@@ -437,6 +438,7 @@ impl Markdown {
             mermaid_state: MermaidState::default(),
             copied_code_blocks: HashSet::default(),
             code_block_scroll_handles: BTreeMap::default(),
+            table_scroll_handles: BTreeMap::default(),
             context_menu_link: None,
             context_menu_selected_text: None,
             search_highlights: Vec::new(),
@@ -469,6 +471,17 @@ impl Markdown {
     fn retain_code_block_scroll_handles(&mut self, ids: &HashSet<usize>) {
         self.code_block_scroll_handles
             .retain(|id, _| ids.contains(id));
+    }
+
+    fn table_scroll_handle(&mut self, id: usize) -> ScrollHandle {
+        self.table_scroll_handles
+            .entry(id)
+            .or_insert_with(ScrollHandle::new)
+            .clone()
+    }
+
+    fn retain_table_scroll_handles(&mut self, ids: &HashSet<usize>) {
+        self.table_scroll_handles.retain(|id, _| ids.contains(id));
     }
 
     fn clear_code_block_scroll_handles(&mut self) {
@@ -1716,6 +1729,7 @@ impl Element for MarkdownElement {
             0
         };
         let mut code_block_ids = HashSet::default();
+        let mut table_ids = HashSet::default();
 
         let mut current_img_block_range: Option<Range<usize>> = None;
         let mut handled_html_block = false;
@@ -2184,30 +2198,77 @@ impl Element for MarkdownElement {
                             builder.table.start(alignments.clone());
 
                             let column_count = alignments.len() as u16;
-                            if self.style.table_size_to_content {
-                                // Full-width row that centers the content-sized table.
-                                builder.push_div(
-                                    div().w_full().flex().flex_row().justify_center(),
-                                    range,
-                                    markdown_end,
-                                );
-                            }
                             let table = div()
                                 .id(("table", range.start))
                                 .grid()
-                                .mb_4()
                                 .border(px(1.5))
                                 .border_color(cx.theme().colors().border)
                                 .rounded_sm()
                                 .overflow_hidden();
-                            let table = if self.style.table_size_to_content {
-                                // Columns sized to content; as a flex item in the row
-                                // above, the box shrinks to fit (capped at full width).
-                                table.grid_cols_max_content(column_count).max_w_full()
+                            if self.style.table_size_to_content {
+                                // `auto` grid tracks size each column to its content
+                                // (min-content floor), like an HTML table — columns never
+                                // collapse below their content and clip it, the failure
+                                // mode of zero-minimum `max-content` tracks whenever taffy
+                                // under-measures the grid's intrinsic width.
+                                //
+                                // The scroll viewport is a plain full-width block — never
+                                // a flex item, so its width is definite rather than an
+                                // intrinsic measurement of the scroll content (which taffy
+                                // gets wrong, squeezing the table). Inside it, content is
+                                // laid out at max-content: the `min_w_full` row centers a
+                                // table that fits, and a wider table scrolls horizontally.
+                                table_ids.insert(range.start);
+                                let scroll_handle = self.markdown.update(cx, |markdown, _| {
+                                    markdown.table_scroll_handle(range.start)
+                                });
+                                let scrollbars = Scrollbars::new(ScrollAxes::Horizontal)
+                                    .id(("markdown-table-scrollbar", range.start))
+                                    .tracked_scroll_handle(&scroll_handle)
+                                    .with_track_along(
+                                        ScrollAxes::Horizontal,
+                                        cx.theme().colors().editor_background,
+                                    )
+                                    .notify_content();
+                                builder.push_div(
+                                    div()
+                                        .w_full()
+                                        .mb_4()
+                                        .relative()
+                                        .custom_scrollbars(scrollbars, window, cx),
+                                    range,
+                                    markdown_end,
+                                );
+                                builder.push_div(
+                                    div()
+                                        .id(("table-scroll", range.start))
+                                        .w_full()
+                                        .overflow_x_scroll()
+                                        .track_scroll(&scroll_handle)
+                                        .map(|mut this| {
+                                            this.style().restrict_scroll_to_axis = Some(true);
+                                            this
+                                        }),
+                                    range,
+                                    markdown_end,
+                                );
+                                builder.push_div(
+                                    div().min_w_full().flex().flex_row().justify_center(),
+                                    range,
+                                    markdown_end,
+                                );
+                                builder.push_div(
+                                    table.grid_cols_auto(column_count),
+                                    range,
+                                    markdown_end,
+                                );
                             } else {
-                                table.grid_cols(column_count).w_full()
-                            };
-                            builder.push_div(table, range, markdown_end);
+                                builder.push_div(
+                                    table.mb_4().grid_cols(column_count).w_full(),
+                                    range,
+                                    markdown_end,
+                                );
+                            }
                         }
                         MarkdownTag::TableHead => {
                             builder.table.start_head();
@@ -2220,9 +2281,13 @@ impl Element for MarkdownElement {
                             let is_header = builder.table.in_head;
                             let row_index = builder.table.row_index;
                             let col_index = builder.table.col_index;
-                            // A cell whose content includes inline code (when boxed)
-                            // or inline math must wrap into per-word boxes so those
-                            // elements flow inline and take their own size.
+                            // A cell with inline math must wrap into per-word boxes so
+                            // the equation flows inline. Inline *code* is deliberately
+                            // NOT boxed in table cells: a `flex_wrap` cell doesn't
+                            // report its content width to the grid's max-content sizing,
+                            // which collapses the column and clips the value. Rendered as
+                            // a normal run instead, the cell is a plain box the grid can
+                            // measure (code is body-size in tables rather than the chip).
                             let cell_wraps = parsed_markdown.events[index + 1..]
                                 .iter()
                                 .take_while(|(_, event)| {
@@ -2231,11 +2296,7 @@ impl Element for MarkdownElement {
                                         MarkdownEvent::End(MarkdownTagEnd::TableCell)
                                     )
                                 })
-                                .any(|(_, event)| match event {
-                                    MarkdownEvent::InlineMath(_) => true,
-                                    MarkdownEvent::Code => self.style.inline_code_box,
-                                    _ => false,
-                                });
+                                .any(|(_, event)| matches!(event, MarkdownEvent::InlineMath(_)));
                             // A wrapping cell injects its leading link's icon inline
                             // (via the link handler), so don't also place it here.
                             let icon = if cell_wraps {
@@ -2358,9 +2419,12 @@ impl Element for MarkdownElement {
                         }
                     }
                     MarkdownTagEnd::Table => {
-                        builder.pop_div();
+                        builder.pop_div(); // table grid
                         if self.style.table_size_to_content {
-                            // Pop the centering row pushed in `MarkdownTag::Table`.
+                            // Pop the centering row, scroll viewport, and scrollbar
+                            // host pushed in `MarkdownTag::Table`.
+                            builder.pop_div();
+                            builder.pop_div();
                             builder.pop_div();
                         }
                         builder.table.end();
@@ -2492,6 +2556,9 @@ impl Element for MarkdownElement {
             self.markdown
                 .update(cx, |markdown, _| markdown.clear_code_block_scroll_handles());
         }
+        self.markdown.update(cx, move |markdown, _| {
+            markdown.retain_table_scroll_handles(&table_ids);
+        });
         let mut rendered_markdown = builder.build();
         let child_layout_id = rendered_markdown.element.request_layout(window, cx);
         let layout_id = window.request_layout(gpui::Style::default(), [child_layout_id], cx);
