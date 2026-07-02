@@ -2281,13 +2281,12 @@ impl Element for MarkdownElement {
                             let is_header = builder.table.in_head;
                             let row_index = builder.table.row_index;
                             let col_index = builder.table.col_index;
-                            // A cell with inline math must wrap into per-word boxes so
-                            // the equation flows inline. Inline *code* is deliberately
-                            // NOT boxed in table cells: a `flex_wrap` cell doesn't
-                            // report its content width to the grid's max-content sizing,
-                            // which collapses the column and clips the value. Rendered as
-                            // a normal run instead, the cell is a plain box the grid can
-                            // measure (code is body-size in tables rather than the chip).
+                            // A cell whose content includes inline code (when boxed)
+                            // or inline math must wrap into per-word boxes so those
+                            // elements flow inline and take their own size. The grid's
+                            // `auto` tracks measure such a flex-wrap cell correctly
+                            // (max-content = one line, min-content = widest box), so
+                            // columns still size to the cell's content.
                             let cell_wraps = parsed_markdown.events[index + 1..]
                                 .iter()
                                 .take_while(|(_, event)| {
@@ -2296,7 +2295,11 @@ impl Element for MarkdownElement {
                                         MarkdownEvent::End(MarkdownTagEnd::TableCell)
                                     )
                                 })
-                                .any(|(_, event)| matches!(event, MarkdownEvent::InlineMath(_)));
+                                .any(|(_, event)| match event {
+                                    MarkdownEvent::InlineMath(_) => true,
+                                    MarkdownEvent::Code => self.style.inline_code_box,
+                                    _ => false,
+                                });
                             // A wrapping cell injects its leading link's icon inline
                             // (via the link handler), so don't also place it here.
                             let icon = if cell_wraps {
