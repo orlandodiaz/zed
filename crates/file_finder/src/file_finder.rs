@@ -2,6 +2,7 @@
 mod file_finder_tests;
 pub mod markdown_search;
 pub mod markdown_search_settings;
+pub mod wiki_link_completion;
 
 use futures::future::join_all;
 pub use open_path_prompt::OpenPathDelegate;
@@ -99,6 +100,7 @@ pub fn init(cx: &mut App) {
     cx.observe_new(OpenPathPrompt::register).detach();
     cx.observe_new(OpenPathPrompt::register_new_path).detach();
     markdown_search::init(cx);
+    wiki_link_completion::init(cx);
 }
 
 impl FileFinder {
