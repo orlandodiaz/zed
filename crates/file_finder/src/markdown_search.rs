@@ -85,6 +85,69 @@ fn worktree_wiki_paths(worktree: &project::Worktree) -> Option<Vec<String>> {
     parsed.markdown_search?.wiki_paths
 }
 
+/// Every wiki-scoped markdown page in the project, as `(path, title)`.
+///
+/// Applies the same `wiki_paths` scoping as the search index: pages must live
+/// inside a wiki folder (or the whole worktree counts when its root is the
+/// wiki), and gitignored entries are skipped.
+pub(crate) fn wiki_pages(project: &Project, cx: &App) -> Vec<(ProjectPath, String)> {
+    let mut pages = Vec::new();
+    for worktree in project.visible_worktrees(cx) {
+        let worktree = worktree.read(cx);
+        let worktree_id = worktree.id();
+        // Per-project `.zed/settings.json` `wiki_paths` (read directly), else global.
+        let wiki_paths = worktree_wiki_paths(worktree)
+            .unwrap_or_else(|| MarkdownSearchSettings::get_global(cx).wiki_paths.clone());
+        let wiki_matcher = PathMatcher::new(&wiki_paths, PathStyle::local()).ok();
+        // Entry paths are worktree-relative, so when the wiki folder is opened
+        // *as* the worktree root, match the root name itself too.
+        let root_is_wiki = wiki_matcher
+            .as_ref()
+            .is_some_and(|matcher| is_wiki(matcher, worktree.root_name()));
+        for entry in worktree.entries(false, 0) {
+            if !entry.is_file() {
+                continue;
+            }
+            let Some(name) = entry.path.file_name() else {
+                continue;
+            };
+            let Some(title) = name
+                .strip_suffix(".md")
+                .or_else(|| name.strip_suffix(".markdown"))
+            else {
+                continue;
+            };
+            if !root_is_wiki
+                && wiki_matcher
+                    .as_ref()
+                    .is_some_and(|matcher| !is_wiki(matcher, &entry.path))
+            {
+                continue;
+            }
+            pages.push((
+                ProjectPath {
+                    worktree_id,
+                    path: entry.path.clone(),
+                },
+                title.to_string(),
+            ));
+        }
+    }
+    pages
+}
+
+/// Obsidian-style custom icon for a markdown page (`assets/…/<name>.icon.svg`),
+/// as an absolute path for `Icon::from_path`. `None` when there's no icon file.
+pub(crate) fn page_icon(
+    project: &Project,
+    project_path: &ProjectPath,
+    cx: &App,
+) -> Option<SharedString> {
+    let worktree = project.worktree_for_id(project_path.worktree_id, cx)?;
+    let abs_path = project_panel::resolve_markdown_page_icon(worktree.read(cx), &project_path.path)?;
+    Some(SharedString::from(abs_path.to_string_lossy().into_owned()))
+}
+
 pub struct MarkdownSearch {
     picker: Entity<Picker<MarkdownSearchDelegate>>,
 }
@@ -194,13 +257,7 @@ impl MarkdownSearchDelegate {
     /// Obsidian-style custom icon for a markdown page (`assets/…/<name>.icon.svg`),
     /// as an absolute path for `Icon::from_path`. `None` when there's no icon file.
     fn page_icon(&self, project_path: &ProjectPath, cx: &App) -> Option<SharedString> {
-        let worktree = self
-            .project
-            .read(cx)
-            .worktree_for_id(project_path.worktree_id, cx)?;
-        let abs_path =
-            project_panel::resolve_markdown_page_icon(worktree.read(cx), &project_path.path)?;
-        Some(SharedString::from(abs_path.to_string_lossy().into_owned()))
+        page_icon(self.project.read(cx), project_path, cx)
     }
 
     /// Reads every `.md` file's contents and collects wiki folders into an
@@ -217,6 +274,12 @@ impl MarkdownSearchDelegate {
             let wiki_paths = worktree_wiki_paths(worktree)
                 .unwrap_or_else(|| MarkdownSearchSettings::get_global(cx).wiki_paths.clone());
             let wiki_matcher = PathMatcher::new(&wiki_paths, PathStyle::local()).ok();
+            // Entry paths are worktree-relative, so when the wiki folder is opened
+            // *as* the worktree root (e.g. `zed ~/work/personal_wiki`), no entry
+            // path contains the wiki name. Match the root name itself too.
+            let root_is_wiki = wiki_matcher
+                .as_ref()
+                .is_some_and(|matcher| is_wiki(matcher, worktree.root_name()));
             // Exclude gitignored entries (e.g. node_modules).
             for entry in worktree.entries(false, 0) {
                 let project_path = ProjectPath {
@@ -225,7 +288,7 @@ impl MarkdownSearchDelegate {
                 };
                 if entry.is_dir() {
                     if let Some(matcher) = &wiki_matcher
-                        && is_wiki(matcher, &entry.path)
+                        && (root_is_wiki || is_wiki(matcher, &entry.path))
                         && let Some(name) = entry.path.file_name()
                     {
                         folders.push(FolderEntry {
@@ -248,9 +311,10 @@ impl MarkdownSearchDelegate {
                 // Only index files inside a configured wiki location, so the
                 // search is scoped (e.g. just `personal_wiki/`) instead of every
                 // `.md` in the monorepo. No matcher configured -> index all.
-                if wiki_matcher
-                    .as_ref()
-                    .is_some_and(|matcher| !is_wiki(matcher, &entry.path))
+                if !root_is_wiki
+                    && wiki_matcher
+                        .as_ref()
+                        .is_some_and(|matcher| !is_wiki(matcher, &entry.path))
                 {
                     continue;
                 }
@@ -286,51 +350,20 @@ impl MarkdownSearchDelegate {
     /// content index is still loading.
     fn filename_matches(&self, query_lower: &str, cx: &App) -> Vec<MarkdownMatch> {
         let mut out = Vec::new();
-        for worktree in self.project.read(cx).visible_worktrees(cx) {
-            let worktree = worktree.read(cx);
-            let worktree_id = worktree.id();
-            // Per-project `.zed/settings.json` `wiki_paths` (read directly), else global.
-            let wiki_paths = worktree_wiki_paths(worktree)
-                .unwrap_or_else(|| MarkdownSearchSettings::get_global(cx).wiki_paths.clone());
-            let wiki_matcher = PathMatcher::new(&wiki_paths, PathStyle::local()).ok();
-            for entry in worktree.entries(false, 0) {
-                if !entry.is_file() {
-                    continue;
-                }
-                let Some(name) = entry.path.file_name() else {
-                    continue;
-                };
-                let Some(title) = name
-                    .strip_suffix(".md")
-                    .or_else(|| name.strip_suffix(".markdown"))
-                else {
-                    continue;
-                };
-                // Scope to the configured wiki location(s), matching `load_index`.
-                if wiki_matcher
-                    .as_ref()
-                    .is_some_and(|matcher| !is_wiki(matcher, &entry.path))
-                {
-                    continue;
-                }
-                let Some(pos) = title.to_ascii_lowercase().find(query_lower) else {
-                    continue;
-                };
-                let project_path = ProjectPath {
-                    worktree_id,
-                    path: entry.path.clone(),
-                };
-                let breadcrumb = breadcrumb_for(&project_path);
-                out.push(MarkdownMatch {
-                    project_path,
-                    kind: MatchKind::File,
-                    title: title.to_string().into(),
-                    breadcrumb,
-                    snippet: SharedString::default(),
-                    snippet_highlights: Vec::new(),
-                    title_pos: pos,
-                });
-            }
+        for (project_path, title) in wiki_pages(self.project.read(cx), cx) {
+            let Some(pos) = title.to_ascii_lowercase().find(query_lower) else {
+                continue;
+            };
+            let breadcrumb = breadcrumb_for(&project_path);
+            out.push(MarkdownMatch {
+                project_path,
+                kind: MatchKind::File,
+                title: title.into(),
+                breadcrumb,
+                snippet: SharedString::default(),
+                snippet_highlights: Vec::new(),
+                title_pos: pos,
+            });
         }
         out.sort_by_key(|m| (m.title_pos, m.title.len()));
         out.truncate(MAX_RESULTS);
@@ -508,7 +541,7 @@ fn search_index(index: &Index, query_lower: &str) -> Vec<MarkdownMatch> {
 }
 
 /// Folder path for a result, shown as a breadcrumb (`a  /  b  /  c`).
-fn breadcrumb_for(path: &ProjectPath) -> SharedString {
+pub(crate) fn breadcrumb_for(path: &ProjectPath) -> SharedString {
     path.path
         .parent()
         .map(|parent| parent.as_unix_str().replace('/', "  /  "))
