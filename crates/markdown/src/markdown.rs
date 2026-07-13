@@ -1084,17 +1084,25 @@ impl MarkdownElement {
         start_index: usize,
     ) -> Option<AnyElement> {
         let resolver = self.link_icon_resolver.as_ref()?;
+        let mut in_paragraph = false;
         for (_, event) in events.get(start_index + 1..)?.iter() {
             match event {
                 // The block leads with a link — use its icon (or none).
                 MarkdownEvent::Start(MarkdownTag::Link { dest_url, .. }) => {
+                    // Inside a paragraph wrapper (a loose list item), an iconned
+                    // leading link forces that paragraph to wrap into per-word
+                    // boxes, and the link handler then injects the icon inline —
+                    // placing it here too would show it twice.
+                    if in_paragraph {
+                        return None;
+                    }
                     let icon_path = resolver(dest_url)?;
                     return svg_icon::render_page_icon(&icon_path, px(16.));
                 }
                 // Skip wrappers/markers that can precede the leading link (a loose
                 // list wraps its content in a paragraph; task items emit a marker).
-                MarkdownEvent::Start(MarkdownTag::Paragraph)
-                | MarkdownEvent::TaskListMarker(_) => continue,
+                MarkdownEvent::Start(MarkdownTag::Paragraph) => in_paragraph = true,
+                MarkdownEvent::TaskListMarker(_) => continue,
                 // End of the block, or any other leading content: no leading link.
                 _ => break,
             }
