@@ -7062,6 +7062,21 @@ impl Workspace {
                 let pane = workspace.active_pane().clone();
                 workspace.unfollow_in_pane(&pane, window, cx);
             }))
+            // Fallback for back/forward when focus sits outside any pane (a
+            // dock, or nothing focused, e.g. right after clicking a markdown
+            // preview link): the pane-level handlers only run when a pane is
+            // on the dispatch path, which would leave a workspace-context
+            // keybinding dead until the user clicks into an item. A pane on
+            // the path still wins — it handles the action and stops
+            // propagation before this runs.
+            .on_action(cx.listener(|workspace, _: &pane::GoBack, window, cx| {
+                let pane = workspace.active_pane().downgrade();
+                workspace.go_back(pane, window, cx).detach_and_log_err(cx);
+            }))
+            .on_action(cx.listener(|workspace, _: &pane::GoForward, window, cx| {
+                let pane = workspace.active_pane().downgrade();
+                workspace.go_forward(pane, window, cx).detach_and_log_err(cx);
+            }))
             .on_action(cx.listener(|workspace, action: &Save, window, cx| {
                 workspace
                     .save_active_item(action.save_intent.unwrap_or(SaveIntent::Save), window, cx)
