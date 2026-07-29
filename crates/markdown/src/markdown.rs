@@ -2006,7 +2006,16 @@ impl Element for MarkdownElement {
                         }
                         MarkdownTag::List(bullet_index) => {
                             builder.push_list(*bullet_index);
-                            builder.push_div(div().pl_2p5(), range, markdown_end);
+                            // Inside a wrapping item row (an item whose own line
+                            // carries a boxed chip or inline math), a nested list
+                            // is a flex sibling of the per-word boxes; without
+                            // full width it flows beside them on the same row
+                            // instead of breaking below.
+                            let mut list = div().pl_2p5();
+                            if builder.wrap_words {
+                                list = list.w_full();
+                            }
+                            builder.push_div(list, range, markdown_end);
                         }
                         MarkdownTag::Item => {
                             let bullet =
