@@ -2232,9 +2232,15 @@ impl Element for MarkdownElement {
                                 // The scroll viewport is a plain full-width block — never
                                 // a flex item, so its width is definite rather than an
                                 // intrinsic measurement of the scroll content (which taffy
-                                // gets wrong, squeezing the table). Inside it, content is
-                                // laid out at max-content: the `min_w_full` row centers a
-                                // table that fits, and a wider table scrolls horizontally.
+                                // gets wrong, squeezing the table). The grid is the
+                                // viewport's *direct* flex child: as a flex item it
+                                // shrinks to the viewport width, compressing columns so
+                                // cell text wraps, but never below its min-content — an
+                                // irreducible table overflows and scrolls instead (scroll
+                                // extent is measured from direct children, so no wrapper
+                                // may sit between the viewport and the grid). `mx_auto`
+                                // centers a narrower table; auto margins only absorb
+                                // positive free space, so they don't affect overflow.
                                 table_ids.insert(range.start);
                                 let scroll_handle = self.markdown.update(cx, |markdown, _| {
                                     markdown.table_scroll_handle(range.start)
@@ -2260,6 +2266,8 @@ impl Element for MarkdownElement {
                                     div()
                                         .id(("table-scroll", range.start))
                                         .w_full()
+                                        .flex()
+                                        .flex_row()
                                         .overflow_x_scroll()
                                         .track_scroll(&scroll_handle)
                                         .map(|mut this| {
@@ -2270,12 +2278,7 @@ impl Element for MarkdownElement {
                                     markdown_end,
                                 );
                                 builder.push_div(
-                                    div().min_w_full().flex().flex_row().justify_center(),
-                                    range,
-                                    markdown_end,
-                                );
-                                builder.push_div(
-                                    table.grid_cols_auto(column_count),
+                                    table.grid_cols_auto(column_count).mx_auto(),
                                     range,
                                     markdown_end,
                                 );
@@ -2441,9 +2444,8 @@ impl Element for MarkdownElement {
                     MarkdownTagEnd::Table => {
                         builder.pop_div(); // table grid
                         if self.style.table_size_to_content {
-                            // Pop the centering row, scroll viewport, and scrollbar
-                            // host pushed in `MarkdownTag::Table`.
-                            builder.pop_div();
+                            // Pop the scroll viewport and scrollbar host pushed in
+                            // `MarkdownTag::Table`.
                             builder.pop_div();
                             builder.pop_div();
                         }
@@ -3070,6 +3072,66 @@ impl MarkdownElementBuilder {
         run_style.refine(code_style);
         // The box paints the chip background; don't also paint it on the run.
         run_style.background_color = None;
+        let chip = div()
+            .px(px(3.))
+            .rounded_sm()
+            .when_some(code_style.font_size, |el, size| el.text_size(size))
+            .when_some(code_style.background_color, |el, bg| el.bg(bg));
+
+        // In a table cell the chip must be able to wrap internally: code values
+        // (paths, identifiers) have no spaces, so as a single text element the
+        // chip's min-content is the full one-line width and the column can
+        // never compress to the pane — the table clips instead. Emit one text
+        // element per separator-delimited segment in a flex-wrap row, so the
+        // value breaks after `\` `/` `.` `_` `-` `:` and the chip's min-content
+        // is just its longest segment. In a paragraph row the chip stays one
+        // atomic element that wraps to the next line as a unit.
+        //
+        // Short values stay atomic even in cells: they don't meaningfully
+        // shrink a column, and segmenting them exposes wrap artifacts (see the
+        // slack note below) for no benefit.
+        const MIN_SEGMENTED_CHIP_LEN: usize = 24;
+        if !self.table.alignments.is_empty() && text.len() >= MIN_SEGMENTED_CHIP_LEN {
+            let mut segments = Vec::new();
+            let mut offset = 0;
+            for segment in text
+                .split_inclusive(|char: char| matches!(char, '\\' | '/' | '.' | '_' | '-' | ':'))
+            {
+                let segment_source_start = source_range.start + offset;
+                offset += segment.len();
+                let styled = StyledText::new(segment.to_string())
+                    .with_runs(vec![run_style.to_run(segment.len())]);
+                self.rendered_lines.push(RenderedLine {
+                    layout: styled.layout().clone(),
+                    source_mappings: vec![SourceMapping {
+                        rendered_index: 0,
+                        source_index: segment_source_start,
+                    }],
+                    source_end: segment_source_start + segment.len(),
+                    language: None,
+                });
+                segments.push(styled.into_any_element());
+            }
+            self.current_source_index = source_range.end;
+            // The extra right padding is slack: the grid track is sized from
+            // the measured one-line sum of the segments, and if the width
+            // handed back at layout lands a fraction of a pixel short of that
+            // sum, the last segment would wrap — visibly, since the row height
+            // was measured for one line. The slack absorbs that boundary noise.
+            let chip = chip
+                .pr(px(5.))
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .children(segments);
+            self.div_stack
+                .last_mut()
+                .unwrap()
+                .extend([chip.into_any_element()]);
+            return;
+        }
+
         let styled =
             StyledText::new(text.to_string()).with_runs(vec![run_style.to_run(text.len())]);
         self.rendered_lines.push(RenderedLine {
@@ -3081,14 +3143,8 @@ impl MarkdownElementBuilder {
             source_end: source_range.end,
             language: None,
         });
-        let chip = div()
-            .flex_none()
-            .px(px(3.))
-            .rounded_sm()
-            .when_some(code_style.font_size, |el, size| el.text_size(size))
-            .when_some(code_style.background_color, |el, bg| el.bg(bg))
-            .child(styled);
         self.current_source_index = source_range.end;
+        let chip = chip.flex_none().child(styled);
         self.div_stack
             .last_mut()
             .unwrap()
