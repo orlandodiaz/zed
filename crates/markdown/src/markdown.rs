@@ -2232,34 +2232,26 @@ impl Element for MarkdownElement {
                                 // The scroll viewport is a plain full-width block — never
                                 // a flex item, so its width is definite rather than an
                                 // intrinsic measurement of the scroll content (which taffy
-                                // gets wrong, squeezing the table). Inside it, content is
-                                // laid out at max-content: the `min_w_full` row centers a
-                                // table that fits, and a wider table scrolls horizontally.
+                                // gets wrong, squeezing the table). The grid must be the
+                                // viewport's *direct* child: the scrollable extent is
+                                // computed from direct children's bounds, and any block
+                                // wrapper in between is laid out at the viewport width, so
+                                // the extent came out zero and the table couldn't scroll at
+                                // all. As a `flex_none` flex item the grid keeps its
+                                // natural (max-content) width; `mx_auto` centers a table
+                                // that fits (auto margins only absorb positive free space).
+                                // No scrollbar — scrolling is trackpad/wheel only.
                                 table_ids.insert(range.start);
                                 let scroll_handle = self.markdown.update(cx, |markdown, _| {
                                     markdown.table_scroll_handle(range.start)
                                 });
-                                let scrollbars = Scrollbars::new(ScrollAxes::Horizontal)
-                                    .id(("markdown-table-scrollbar", range.start))
-                                    .tracked_scroll_handle(&scroll_handle)
-                                    .with_track_along(
-                                        ScrollAxes::Horizontal,
-                                        cx.theme().colors().editor_background,
-                                    )
-                                    .notify_content();
-                                builder.push_div(
-                                    div()
-                                        .w_full()
-                                        .mb_4()
-                                        .relative()
-                                        .custom_scrollbars(scrollbars, window, cx),
-                                    range,
-                                    markdown_end,
-                                );
                                 builder.push_div(
                                     div()
                                         .id(("table-scroll", range.start))
                                         .w_full()
+                                        .mb_4()
+                                        .flex()
+                                        .flex_row()
                                         .overflow_x_scroll()
                                         .track_scroll(&scroll_handle)
                                         .map(|mut this| {
@@ -2270,12 +2262,7 @@ impl Element for MarkdownElement {
                                     markdown_end,
                                 );
                                 builder.push_div(
-                                    div().min_w_full().flex().flex_row().justify_center(),
-                                    range,
-                                    markdown_end,
-                                );
-                                builder.push_div(
-                                    table.grid_cols_auto(column_count),
+                                    table.grid_cols_auto(column_count).flex_none().mx_auto(),
                                     range,
                                     markdown_end,
                                 );
@@ -2441,10 +2428,7 @@ impl Element for MarkdownElement {
                     MarkdownTagEnd::Table => {
                         builder.pop_div(); // table grid
                         if self.style.table_size_to_content {
-                            // Pop the centering row, scroll viewport, and scrollbar
-                            // host pushed in `MarkdownTag::Table`.
-                            builder.pop_div();
-                            builder.pop_div();
+                            // Pop the scroll viewport pushed in `MarkdownTag::Table`.
                             builder.pop_div();
                         }
                         builder.table.end();

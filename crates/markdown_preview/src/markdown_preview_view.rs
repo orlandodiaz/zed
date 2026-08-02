@@ -1923,6 +1923,14 @@ impl Render for MarkdownPreviewView {
                     .id("markdown-preview-scroll-container")
                     .size_full()
                     .overflow_y_scroll()
+                    // Without this, a purely horizontal wheel delta (shift+scroll,
+                    // or a trackpad swipe over a wide table) falls back to scrolling
+                    // the page vertically — fighting the table's own horizontal
+                    // scroll, which handles that same delta.
+                    .map(|mut this| {
+                        this.style().restrict_scroll_to_axis = Some(true);
+                        this
+                    })
                     .track_scroll(&self.scroll_handle)
                     .p_4()
                     // Body text inherits this size (gpui text runs don't carry a
