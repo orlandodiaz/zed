@@ -53,6 +53,7 @@ const INDEX_REBUILD_DEBOUNCE: Duration = Duration::from_millis(250);
 struct WorktreeIndices {
     images: Rc<HashMap<String, PathBuf>>,
     link_icons: Rc<HashMap<String, PathBuf>>,
+    emoji_icons: Rc<HashMap<String, PathBuf>>,
 }
 
 /// Process-wide cache of per-worktree indices, shared across every markdown
@@ -93,6 +94,9 @@ pub struct MarkdownPreviewView {
     /// This view's handle on the current worktree's shared page-icon index: a
     /// page name → its icon, so a wikilink can show the target page's icon.
     link_icon_index: Rc<HashMap<String, PathBuf>>,
+    /// This view's handle on the current worktree's shared emoji index: a
+    /// shortcode name → SVG path, so `:check` renders `assets/check.svg` inline.
+    emoji_icon_index: Rc<HashMap<String, PathBuf>>,
     /// The worktree `image_index`/`link_icon_index` currently point at. Switching
     /// to a file in a different worktree re-points them (from the shared cache).
     indexed_worktree: Option<WorktreeId>,
@@ -419,6 +423,7 @@ impl MarkdownPreviewView {
                 current_path: None,
                 image_index: Rc::new(HashMap::new()),
                 link_icon_index: Rc::new(HashMap::new()),
+                emoji_icon_index: Rc::new(HashMap::new()),
                 indexed_worktree: None,
                 index_rebuild_task: None,
                 _project_subscription: None,
@@ -627,6 +632,7 @@ impl MarkdownPreviewView {
         };
         self.image_index = indices.images;
         self.link_icon_index = indices.link_icons;
+        self.emoji_icon_index = indices.emoji_icons;
         self.indexed_worktree = Some(worktree_id);
     }
 
@@ -641,6 +647,7 @@ impl MarkdownPreviewView {
         let indices = WorktreeIndices {
             images: Rc::new(build_image_index(&self.workspace, Some(worktree_id), None, cx)),
             link_icons: Rc::new(build_link_icon_index(&self.workspace, Some(worktree_id), cx)),
+            emoji_icons: Rc::new(build_emoji_icon_index(&self.workspace, Some(worktree_id), cx)),
         };
         cx.default_global::<MarkdownIndexCache>()
             .by_worktree
@@ -663,6 +670,7 @@ impl MarkdownPreviewView {
                 let indices = this.build_and_cache_indices(worktree_id, cx);
                 this.image_index = indices.images;
                 this.link_icon_index = indices.link_icons;
+                this.emoji_icon_index = indices.emoji_icons;
                 cx.notify();
             })
             .ok();
@@ -1072,6 +1080,10 @@ impl MarkdownPreviewView {
         .link_icon_resolver({
             let link_icon_index = self.link_icon_index.clone();
             move |dest_url| link_icon_index.get(&dest_url.to_ascii_lowercase()).cloned()
+        })
+        .emoji_icon_resolver({
+            let emoji_icon_index = self.emoji_icon_index.clone();
+            move |name| emoji_icon_index.get(&name.to_ascii_lowercase()).cloned()
         })
         // (resolver returns the icon SVG path; the markdown element renders it as
         // crisp vector geometry rather than a rasterized image.)
@@ -1762,6 +1774,52 @@ fn build_link_icon_index(
             if let Some(icon) = resolve_markdown_page_icon(worktree, &entry.path) {
                 index.insert(stem.to_ascii_lowercase(), icon);
             }
+        }
+    }
+    index
+}
+
+/// Builds the emoji shortcode index: any `<name>.svg` under an `assets/`
+/// directory, keyed by lowercased stem, so `:check` renders `assets/check.svg`.
+/// Page icons (`<page>.icon.svg`) are excluded by the no-dot stem requirement,
+/// which also keeps shortcode names word-like.
+fn build_emoji_icon_index(
+    workspace: &WeakEntity<Workspace>,
+    worktree_id: Option<WorktreeId>,
+    cx: &App,
+) -> HashMap<String, PathBuf> {
+    let mut index: HashMap<String, PathBuf> = HashMap::new();
+    let Some(workspace) = workspace.upgrade() else {
+        return index;
+    };
+    let project = workspace.read(cx).project().read(cx);
+    for worktree in project.worktrees(cx) {
+        let worktree = worktree.read(cx);
+        // Scope to the previewed file's worktree (see `build_image_index`).
+        if worktree_id.is_some_and(|id| worktree.id() != id) {
+            continue;
+        }
+        // include_ignored: wiki assets are often gitignored.
+        for entry in worktree.files(true, 0) {
+            if entry.path.extension() != Some("svg") {
+                continue;
+            }
+            let Some(stem) = entry.path.file_stem() else {
+                continue;
+            };
+            if stem.is_empty() || stem.contains('.') {
+                continue;
+            }
+            if !entry.path.parent().is_some_and(|parent| {
+                parent
+                    .components()
+                    .any(|component| component == "assets" || component == ".assets")
+            }) {
+                continue;
+            }
+            index
+                .entry(stem.to_ascii_lowercase())
+                .or_insert_with(|| worktree.absolutize(&entry.path));
         }
     }
     index

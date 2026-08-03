@@ -986,8 +986,31 @@ pub struct MarkdownElement {
     /// an icon SVG to show before the link when it leads a table cell or list item.
     /// Rendered as crisp vector geometry rather than a rasterized image.
     link_icon_resolver: Option<Box<dyn Fn(&str) -> Option<PathBuf>>>,
+    /// Given an emoji shortcode name (the `check` in `:check` / `:check:`),
+    /// returns the path to an SVG to render inline in place of the shortcode.
+    emoji_icon_resolver: Option<Box<dyn Fn(&str) -> Option<PathBuf>>>,
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
+}
+
+/// Parses an emoji shortcode (`:name` or `:name:`) at the start of `token`,
+/// returning the name and the shortcode's byte length. Names are restricted to
+/// `[A-Za-z0-9_-]` so paths, URLs and `::` in prose don't parse as shortcodes.
+fn parse_emoji_shortcode(token: &str) -> Option<(&str, usize)> {
+    let rest = token.strip_prefix(':')?;
+    let name_len = rest
+        .char_indices()
+        .find(|(_, char)| !(char.is_ascii_alphanumeric() || *char == '_' || *char == '-'))
+        .map_or(rest.len(), |(index, _)| index);
+    if name_len == 0 {
+        return None;
+    }
+    let name = &rest[..name_len];
+    let mut len = 1 + name_len;
+    if rest[name_len..].starts_with(':') {
+        len += 1;
+    }
+    Some((name, len))
 }
 
 impl MarkdownElement {
@@ -1004,6 +1027,7 @@ impl MarkdownElement {
             on_checkbox_toggle: None,
             image_resolver: None,
             link_icon_resolver: None,
+            emoji_icon_resolver: None,
             show_root_block_markers: false,
             autoscroll: AutoscrollBehavior::Propagate,
         }
@@ -1117,6 +1141,82 @@ impl MarkdownElement {
             .as_ref()
             .and_then(|resolver| resolver(dest_url))
             .is_some()
+    }
+
+    pub fn emoji_icon_resolver(
+        mut self,
+        resolver: impl Fn(&str) -> Option<PathBuf> + 'static,
+    ) -> Self {
+        self.emoji_icon_resolver = Some(Box::new(resolver));
+        self
+    }
+
+    /// Whether `text` contains an emoji shortcode that resolves to an icon —
+    /// used to decide whether a paragraph/list item/table cell must wrap into
+    /// per-word boxes so the icon can flow inline.
+    fn text_has_emoji(&self, text: &str) -> bool {
+        let Some(resolver) = self.emoji_icon_resolver.as_ref() else {
+            return false;
+        };
+        let mut search = text;
+        while let Some(position) = search.find(':') {
+            if let Some((name, _)) = parse_emoji_shortcode(&search[position..])
+                && resolver(name).is_some()
+            {
+                return true;
+            }
+            search = &search[position + 1..];
+        }
+        false
+    }
+
+    /// Emit `text`, replacing resolvable emoji shortcodes with their inline SVG
+    /// icons. Only valid in a wrapping (per-word) container, where an inline
+    /// element can flow between word boxes.
+    fn push_text_with_emoji(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        text: &str,
+        range: Range<usize>,
+    ) {
+        let Some(resolver) = self.emoji_icon_resolver.as_ref() else {
+            builder.push_text(text, range);
+            return;
+        };
+        let mut emitted = 0;
+        let mut search = 0;
+        while let Some(colon) = text[search..].find(':') {
+            let token_start = search + colon;
+            if let Some((name, token_len)) = parse_emoji_shortcode(&text[token_start..])
+                && let Some(icon_path) = resolver(name)
+                && let Some(icon) = svg_icon::render_page_icon(&icon_path, px(16.))
+            {
+                if emitted < token_start {
+                    builder.push_text(
+                        &text[emitted..token_start],
+                        range.start + emitted..range.start + token_start,
+                    );
+                }
+                // Same baseline nudge as the inline wikilink icons.
+                let icon = div()
+                    .flex_none()
+                    .relative()
+                    .top(px(-1.5))
+                    .child(icon)
+                    .into_any_element();
+                builder.push_inline_icon(
+                    icon,
+                    range.start + token_start..range.start + token_start + token_len,
+                );
+                emitted = token_start + token_len;
+                search = emitted;
+            } else {
+                search = token_start + 1;
+            }
+        }
+        if emitted < text.len() {
+            builder.push_text(&text[emitted..], range.start + emitted..range.end);
+        }
     }
 
     pub fn show_root_block_markers(mut self) -> Self {
@@ -1817,8 +1917,8 @@ impl Element for MarkdownElement {
                         }
                         MarkdownTag::Paragraph => {
                             // Wrap into per-word boxes when the paragraph must flow
-                            // an inline element: inline math, or a wikilink whose
-                            // page icon is shown before it.
+                            // an inline element: inline math, a wikilink whose
+                            // page icon is shown before it, or an emoji shortcode.
                             let wrap_inline = parsed_markdown.events[index + 1..]
                                 .iter()
                                 .take_while(|(_, event)| {
@@ -1827,12 +1927,15 @@ impl Element for MarkdownElement {
                                         MarkdownEvent::End(MarkdownTagEnd::Paragraph)
                                     )
                                 })
-                                .any(|(_, event)| match event {
+                                .any(|(event_range, event)| match event {
                                     MarkdownEvent::InlineMath(_) => true,
                                     MarkdownEvent::Code => self.style.inline_code_box,
                                     MarkdownEvent::Start(MarkdownTag::Link { dest_url, .. }) => {
                                         self.link_has_icon(dest_url)
                                     }
+                                    MarkdownEvent::Text => self.text_has_emoji(
+                                        &parsed_markdown.source[event_range.clone()],
+                                    ),
                                     _ => false,
                                 });
                             self.push_markdown_paragraph(
@@ -2073,7 +2176,7 @@ impl Element for MarkdownElement {
                             // item's content row to become a wrapping flex row.
                             let mut depth = 0usize;
                             let mut item_has_inline_math = false;
-                            for (_, event) in &parsed_markdown.events[index + 1..] {
+                            for (event_range, event) in &parsed_markdown.events[index + 1..] {
                                 match event {
                                     MarkdownEvent::InlineMath(_) if depth == 0 => {
                                         item_has_inline_math = true;
@@ -2081,6 +2184,15 @@ impl Element for MarkdownElement {
                                     }
                                     MarkdownEvent::Code
                                         if depth == 0 && self.style.inline_code_box =>
+                                    {
+                                        item_has_inline_math = true;
+                                        break;
+                                    }
+                                    MarkdownEvent::Text
+                                        if depth == 0
+                                            && self.text_has_emoji(
+                                                &parsed_markdown.source[event_range.clone()],
+                                            ) =>
                                     {
                                         item_has_inline_math = true;
                                         break;
@@ -2299,9 +2411,12 @@ impl Element for MarkdownElement {
                                         MarkdownEvent::End(MarkdownTagEnd::TableCell)
                                     )
                                 })
-                                .any(|(_, event)| match event {
+                                .any(|(event_range, event)| match event {
                                     MarkdownEvent::InlineMath(_) => true,
                                     MarkdownEvent::Code => self.style.inline_code_box,
+                                    MarkdownEvent::Text => self.text_has_emoji(
+                                        &parsed_markdown.source[event_range.clone()],
+                                    ),
                                     _ => false,
                                 });
                             // A wrapping cell injects its leading link's icon inline
@@ -2454,7 +2569,15 @@ impl Element for MarkdownElement {
                     _ => log::debug!("unsupported markdown tag end: {:?}", tag),
                 },
                 MarkdownEvent::Text => {
-                    builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                    let text = &parsed_markdown.source[range.clone()];
+                    // Inline emoji icons can only flow between word boxes, so
+                    // they're limited to wrapping containers (which the block
+                    // scans above enable whenever text contains a shortcode).
+                    if builder.wrap_words {
+                        self.push_text_with_emoji(&mut builder, text, range.clone());
+                    } else {
+                        builder.push_text(text, range.clone());
+                    }
                 }
                 MarkdownEvent::SubstitutedText(text) => {
                     builder.push_text(text, range.clone());
@@ -3013,6 +3136,14 @@ impl MarkdownElementBuilder {
     /// inter-word spacing. Word boxes lose cross-word shaping, but each is
     /// registered as a `RenderedLine` so text selection still works — selection is
     /// bounds-based (it already handles non-stacked boxes like table columns).
+    /// Place a non-text inline element (e.g. an emoji icon) into the current
+    /// wrapping div, advancing past its source range. The element registers no
+    /// `RenderedLine`, so selection/copy skips over it.
+    fn push_inline_icon(&mut self, icon: AnyElement, source_range: Range<usize>) {
+        self.current_source_index = source_range.end;
+        self.div_stack.last_mut().unwrap().extend([icon]);
+    }
+
     fn push_wrapped_words(&mut self, text: &str, source_range: Range<usize>) {
         let style = self.text_style();
         let mut offset = 0;
