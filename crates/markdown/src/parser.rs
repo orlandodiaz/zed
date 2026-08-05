@@ -214,9 +214,19 @@ pub(crate) fn parse_markdown_with_options(
                         id,
                     } => {
                         within_link = true;
+                        let mut dest_url = dest_url.into_string();
+                        // In a table, an aliased wikilink needs its pipe escaped
+                        // (`[[Page\|Alias]]`, as in Obsidian/GitHub) so it doesn't
+                        // split the cell — but pulldown keeps that `\` on the
+                        // target, which would break page resolution and icons.
+                        if matches!(link_type, pulldown_cmark::LinkType::WikiLink { .. })
+                            && dest_url.ends_with('\\')
+                        {
+                            dest_url.pop();
+                        }
                         MarkdownTag::Link {
                             link_type,
-                            dest_url: SharedString::from(dest_url.into_string()),
+                            dest_url: SharedString::from(dest_url),
                             title: SharedString::from(title.into_string()),
                             id: SharedString::from(id.into_string()),
                         }
