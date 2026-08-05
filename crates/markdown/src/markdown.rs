@@ -2622,6 +2622,20 @@ impl Element for MarkdownElement {
                         builder.pop_text_style();
                         continue;
                     }
+                    if parser::is_br_tag(html) {
+                        if builder.wrap_words {
+                            // In a wrapping (per-word) row a "\n" would only
+                            // grow one word box; a full-width zero-height
+                            // spacer forces the flex row onto a new line.
+                            builder.push_inline_icon(
+                                div().w_full().h_0().into_any_element(),
+                                range.clone(),
+                            );
+                        } else {
+                            builder.push_text("\n", range.clone());
+                        }
+                        continue;
+                    }
                     builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
                 }
                 MarkdownEvent::Rule => {

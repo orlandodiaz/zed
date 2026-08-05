@@ -374,11 +374,13 @@ pub(crate) fn parse_markdown_with_options(
                     parsed,
                 }];
 
+                // `<br>` must survive as its own InlineHtml event (the renderer
+                // turns it into a line break); merging would erase it below.
                 while matches!(parser.peek(), Some((pulldown_cmark::Event::Text(_), _)))
                     || (parse_html
                         && matches!(
                             parser.peek(),
-                            Some((pulldown_cmark::Event::InlineHtml(_), _))
+                            Some((pulldown_cmark::Event::InlineHtml(html), _)) if !is_br_tag(html)
                         ))
                 {
                     let Some((next_event, next_range)) = parser.next() else {
@@ -542,6 +544,14 @@ pub(crate) fn parse_markdown_with_options(
         heading_slugs,
         footnote_definitions,
     }
+}
+
+/// Whether an inline HTML snippet is a `<br>` line break tag.
+pub(crate) fn is_br_tag(html: &str) -> bool {
+    let tag = html.trim();
+    tag.eq_ignore_ascii_case("<br>")
+        || tag.eq_ignore_ascii_case("<br/>")
+        || tag.eq_ignore_ascii_case("<br />")
 }
 
 fn build_footnote_definitions(
