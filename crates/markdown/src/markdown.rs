@@ -1197,11 +1197,13 @@ impl MarkdownElement {
                         range.start + emitted..range.start + token_start,
                     );
                 }
-                // Same baseline nudge as the inline wikilink icons.
+                // Baseline-aligned flex puts the icon's bottom edge on the text
+                // baseline; nudge it up so its visual center matches the text's
+                // (the wikilink icons' -1.5 reads slightly low next to prose).
                 let icon = div()
                     .flex_none()
                     .relative()
-                    .top(px(-1.5))
+                    .top(px(-3.))
                     .child(icon)
                     .into_any_element();
                 builder.push_inline_icon(
