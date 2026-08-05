@@ -1822,6 +1822,25 @@ fn build_emoji_icon_index(
                 .or_insert_with(|| worktree.absolutize(&entry.path));
         }
     }
+    // Global fallback: `~/.config/zed/wiki-assets/*.svg` works in every
+    // project, so shared emojis don't have to be copied into each wiki.
+    // A worktree's own assets win on name clashes (`or_insert` above ran
+    // first, and `entry(...).or_insert` here keeps existing entries).
+    if let Ok(entries) = std::fs::read_dir(paths::config_dir().join("wiki-assets")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("svg") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if stem.is_empty() || stem.contains('.') {
+                continue;
+            }
+            index.entry(stem.to_ascii_lowercase()).or_insert(path);
+        }
+    }
     index
 }
 
