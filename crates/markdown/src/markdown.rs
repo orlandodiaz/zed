@@ -1108,41 +1108,6 @@ impl MarkdownElement {
         self
     }
 
-    /// If the cell/list-item content beginning at `start_index` leads with a link
-    /// whose destination resolves to an icon, returns that icon as a small inline
-    /// element (16px), so it can be placed before the link in the block container.
-    fn leading_link_icon(
-        &self,
-        events: &[(Range<usize>, MarkdownEvent)],
-        start_index: usize,
-    ) -> Option<AnyElement> {
-        let resolver = self.link_icon_resolver.as_ref()?;
-        let mut in_paragraph = false;
-        for (_, event) in events.get(start_index + 1..)?.iter() {
-            match event {
-                // The block leads with a link — use its icon (or none).
-                MarkdownEvent::Start(MarkdownTag::Link { dest_url, .. }) => {
-                    // Inside a paragraph wrapper (a loose list item), an iconned
-                    // leading link forces that paragraph to wrap into per-word
-                    // boxes, and the link handler then injects the icon inline —
-                    // placing it here too would show it twice.
-                    if in_paragraph {
-                        return None;
-                    }
-                    let icon_path = resolver(dest_url)?;
-                    return svg_icon::render_page_icon(&icon_path, px(16.));
-                }
-                // Skip wrappers/markers that can precede the leading link (a loose
-                // list wraps its content in a paragraph; task items emit a marker).
-                MarkdownEvent::Start(MarkdownTag::Paragraph) => in_paragraph = true,
-                MarkdownEvent::TaskListMarker(_) => continue,
-                // End of the block, or any other leading content: no leading link.
-                _ => break,
-            }
-        }
-        None
-    }
-
     /// Whether a link destination resolves to a page icon — used to decide
     /// whether a paragraph must wrap so the icon can flow inline before the link.
     fn link_has_icon(&self, dest_url: &str) -> bool {
@@ -1488,7 +1453,6 @@ impl MarkdownElement {
         &self,
         builder: &mut MarkdownElementBuilder,
         bullet: AnyElement,
-        icon: Option<AnyElement>,
         range: &Range<usize>,
         markdown_end: usize,
         wrap_inline: bool,
@@ -1500,9 +1464,7 @@ impl MarkdownElement {
                 })
                 .h_flex()
                 .items_start()
-                .child(bullet)
-                // Icon (if any) sits between the bullet and the item's text.
-                .children(icon),
+                .child(bullet),
             range,
             markdown_end,
         );
@@ -2359,6 +2321,15 @@ impl Element for MarkdownElement {
                                         item_has_inline_math = true;
                                         break;
                                     }
+                                    // An iconned link makes the item's line an
+                                    // inline-flow row so the icon renders in
+                                    // place before the link.
+                                    MarkdownEvent::Start(MarkdownTag::Link { dest_url, .. })
+                                        if depth == 0 && self.link_has_icon(dest_url) =>
+                                    {
+                                        item_has_inline_math = true;
+                                        break;
+                                    }
                                     // Inline formatting (bold/italic/strikethrough/
                                     // links) is transparent here: code or math wrapped
                                     // in it still belongs to the item's own line. Only
@@ -2386,17 +2357,9 @@ impl Element for MarkdownElement {
                                     _ => {}
                                 }
                             }
-                            // A wrapping item injects its leading link's icon inline
-                            // (via the link handler), so don't also place it here.
-                            let icon = if item_has_inline_math {
-                                None
-                            } else {
-                                self.leading_link_icon(&parsed_markdown.events, index)
-                            };
                             self.push_markdown_list_item(
                                 &mut builder,
                                 bullet,
-                                icon,
                                 range,
                                 markdown_end,
                                 item_has_inline_math,
@@ -2423,17 +2386,12 @@ impl Element for MarkdownElement {
                             if builder.code_block_stack.is_empty() {
                                 builder.push_link(dest_url.clone(), range.clone());
                                 // Show the target page's icon inline before the
-                                // link. Only in paragraphs that wrap into per-word
-                                // boxes (so it flows and the line still wraps);
-                                // leading icons in lists/tables are handled by
-                                // `leading_link_icon`. Never inside a wrapping
-                                // table cell: an inline icon element next to a
-                                // chip destabilizes the grid's row-height
-                                // measurement — the final layout wraps a word the
-                                // measured row never budgeted for, and the table
-                                // clips the overflow (its rounded corners clip).
+                                // link. Only in inline-flow (per-word) containers,
+                                // where an element can sit between word boxes —
+                                // the block scans enable that mode for any
+                                // paragraph, list item, or table cell containing
+                                // an iconned link.
                                 if builder.wrap_words
-                                    && builder.table.alignments.is_empty()
                                     && let Some(resolver) = self.link_icon_resolver.as_ref()
                                     && let Some(icon_path) = resolver(dest_url)
                                     && let Some(icon) =
@@ -2571,7 +2529,9 @@ impl Element for MarkdownElement {
                             // `auto` tracks measure such a flex-wrap cell correctly
                             // (max-content = one line, min-content = widest box), so
                             // columns still size to the cell's content.
-                            let cell_wraps = parsed_markdown.events[index + 1..]
+                            let mut cell_wraps = false;
+                            let mut cell_has_line_break = false;
+                            for (event_range, event) in parsed_markdown.events[index + 1..]
                                 .iter()
                                 .take_while(|(_, event)| {
                                     !matches!(
@@ -2579,23 +2539,28 @@ impl Element for MarkdownElement {
                                         MarkdownEvent::End(MarkdownTagEnd::TableCell)
                                     )
                                 })
-                                .any(|(event_range, event)| match event {
-                                    MarkdownEvent::InlineMath(_) => true,
-                                    MarkdownEvent::Code => self.style.inline_code_box,
-                                    MarkdownEvent::Text => self.text_has_emoji(
-                                        &parsed_markdown.source[event_range.clone()],
-                                    ),
-                                    _ => false,
-                                });
-                            // Wrapping cells render links without icons entirely
-                            // (see the Link handler): an icon element in the
-                            // per-word flow destabilizes row-height measurement.
-                            let icon = if cell_wraps {
-                                None
-                            } else {
-                                self.leading_link_icon(&parsed_markdown.events, index)
-                            };
-
+                            {
+                                match event {
+                                    MarkdownEvent::InlineMath(_) => cell_wraps = true,
+                                    MarkdownEvent::Code if self.style.inline_code_box => {
+                                        cell_wraps = true
+                                    }
+                                    MarkdownEvent::Text => {
+                                        cell_wraps |= self.text_has_emoji(
+                                            &parsed_markdown.source[event_range.clone()],
+                                        )
+                                    }
+                                    MarkdownEvent::Start(MarkdownTag::Link {
+                                        dest_url, ..
+                                    }) => cell_wraps |= self.link_has_icon(dest_url),
+                                    MarkdownEvent::InlineHtml => {
+                                        cell_has_line_break |= parser::is_br_tag(
+                                            &parsed_markdown.source[event_range.clone()],
+                                        )
+                                    }
+                                    _ => {}
+                                }
+                            }
                             builder.push_div(
                                 div()
                                     .when(col_index > 0, |this| this.border_l_1())
@@ -2609,18 +2574,38 @@ impl Element for MarkdownElement {
                                     .when(!is_header && row_index % 2 == 1, |this| {
                                         this.bg(cx.theme().colors().panel_background)
                                     })
+                                    // Inline-flow cells (chip/math/emoji/iconned
+                                    // links) are a flex row of per-word boxes but
+                                    // must NOT wrap: tables size to content and
+                                    // scroll horizontally, and a wrappable cell
+                                    // whose final layout breaks a line the
+                                    // measured row never budgeted for overlaps or
+                                    // clips the rows below. A cell with explicit
+                                    // `<br>` breaks becomes a column of stacked
+                                    // line rows instead (see the InlineHtml
+                                    // handler) — a wrapping row with full-width
+                                    // break spacers would measure max-content as
+                                    // all its lines laid out side by side,
+                                    // blowing the column width out to their sum.
                                     .when(cell_wraps, |this| {
-                                        this.flex().flex_row().flex_wrap().items_baseline()
-                                    })
-                                    // A cell that leads with an iconned link becomes a
-                                    // flex row so the icon sits before the link text.
-                                    .when_some(icon, |this, icon| {
-                                        this.flex().flex_row().items_center().gap_1().child(icon)
+                                        if cell_has_line_break {
+                                            this.flex().flex_col()
+                                        } else {
+                                            this.flex().flex_row().items_baseline()
+                                        }
                                     }),
                                 range,
                                 markdown_end,
                             );
                             builder.wrap_words = cell_wraps;
+                            if cell_wraps && cell_has_line_break {
+                                builder.in_multiline_cell = true;
+                                builder.push_div(
+                                    div().flex().flex_row().items_baseline(),
+                                    range,
+                                    markdown_end,
+                                );
+                            }
                         }
                         _ => log::debug!("unsupported markdown tag {:?}", tag),
                     }
@@ -2735,6 +2720,11 @@ impl Element for MarkdownElement {
                     MarkdownTagEnd::TableCell => {
                         builder.replace_pending_checkbox(range);
                         builder.wrap_words = false;
+                        // Pop the open line row of a `<br>` multi-line cell.
+                        if builder.in_multiline_cell {
+                            builder.in_multiline_cell = false;
+                            builder.pop_div();
+                        }
                         builder.pop_div();
                         builder.table.end_cell();
                     }
@@ -2804,7 +2794,17 @@ impl Element for MarkdownElement {
                         continue;
                     }
                     if parser::is_br_tag(html) {
-                        if builder.wrap_words {
+                        if builder.in_multiline_cell {
+                            // Close the current line row and start the next —
+                            // stacked rows keep the cell's intrinsic width at
+                            // the widest line (see the TableCell handler).
+                            builder.pop_div();
+                            builder.push_div(
+                                div().flex().flex_row().items_baseline(),
+                                range,
+                                markdown_end,
+                            );
+                        } else if builder.wrap_words {
                             // In a wrapping (per-word) row a "\n" would only
                             // grow one word box; a full-width zero-height
                             // spacer forces the flex row onto a new line.
@@ -3137,6 +3137,9 @@ struct MarkdownElementBuilder {
     /// The background of the currently open diff row div, if one is open —
     /// consecutive same-tint lines share a row (see `push_diff_lines`).
     open_diff_row: Option<Option<Hsla>>,
+    /// Inside a table cell with `<br>` breaks, whose lines render as stacked
+    /// row divs; a `<br>` closes the open row and starts the next.
+    in_multiline_cell: bool,
     /// When set (inside a footnote/source definition), paragraphs use tight
     /// spacing so the sources list isn't stretched out by body paragraph margins.
     in_footnote: bool,
@@ -3186,6 +3189,7 @@ impl MarkdownElementBuilder {
             wrap_words: false,
             diff_block_tints: None,
             open_diff_row: None,
+            in_multiline_cell: false,
             in_footnote: false,
             open_centers: 0,
             html_comment: false,
