@@ -2266,8 +2266,14 @@ impl Element for MarkdownElement {
                                 // link. Only in paragraphs that wrap into per-word
                                 // boxes (so it flows and the line still wraps);
                                 // leading icons in lists/tables are handled by
-                                // `leading_link_icon`.
+                                // `leading_link_icon`. Never inside a wrapping
+                                // table cell: an inline icon element next to a
+                                // chip destabilizes the grid's row-height
+                                // measurement — the final layout wraps a word the
+                                // measured row never budgeted for, and the table
+                                // clips the overflow (its rounded corners clip).
                                 if builder.wrap_words
+                                    && builder.table.alignments.is_empty()
                                     && let Some(resolver) = self.link_icon_resolver.as_ref()
                                     && let Some(icon_path) = resolver(dest_url)
                                     && let Some(icon) =
@@ -2421,8 +2427,9 @@ impl Element for MarkdownElement {
                                     ),
                                     _ => false,
                                 });
-                            // A wrapping cell injects its leading link's icon inline
-                            // (via the link handler), so don't also place it here.
+                            // Wrapping cells render links without icons entirely
+                            // (see the Link handler): an icon element in the
+                            // per-word flow destabilizes row-height measurement.
                             let icon = if cell_wraps {
                                 None
                             } else {
