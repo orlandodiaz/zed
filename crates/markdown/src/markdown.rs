@@ -756,7 +756,16 @@ impl Markdown {
             if let Some(registry) = language_registry.as_ref() {
                 for name in language_names {
                     let language = if !name.is_empty() {
-                        registry.language_for_name_or_extension(&name).left_future()
+                        // A ```diff <language> fence highlights with the inner
+                        // language while the diff renderer adds the row tints;
+                        // resolve the inner name but keep the full fence string
+                        // as the key the renderer looks up.
+                        let lookup = name
+                            .strip_prefix("diff ")
+                            .map(str::trim)
+                            .filter(|inner| !inner.is_empty())
+                            .unwrap_or(&name);
+                        registry.language_for_name_or_extension(lookup).left_future()
                     } else if let Some(fallback) = &fallback {
                         registry.language_for_name(fallback.as_ref()).right_future()
                     } else {
@@ -1168,6 +1177,108 @@ impl MarkdownElement {
             search = &search[position + 1..];
         }
         false
+    }
+
+    /// Emit code text inside a ```diff block as one row div per line, tinting
+    /// added/removed/hunk rows GitHub-style. Each row carries its own text, so
+    /// tint and text stay aligned by construction; the diff grammar highlights
+    /// line by line, which is sound because diff syntax is line-oriented.
+    fn push_diff_lines(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        text: &str,
+        range: Range<usize>,
+        markdown_end: usize,
+    ) {
+        let Some(tints) = builder.diff_block_tints else {
+            return;
+        };
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            let line_start = range.start + offset;
+            offset += line.len();
+            let content = line.strip_suffix('\n').unwrap_or(line);
+            let background = if content.starts_with("+++") || content.starts_with("---") {
+                None
+            } else if content.starts_with('+') {
+                Some(tints.added)
+            } else if content.starts_with('-') {
+                Some(tints.deleted)
+            } else if content.starts_with("@@") {
+                Some(tints.hunk)
+            } else {
+                None
+            };
+            // Consecutive same-tint lines share one row div (its text grows by
+            // `\n`-separated lines): with one div per line, fractional line
+            // heights leave occasional 1px rounding gaps between rows, visible
+            // as dark seams across a tinted region. Rows stay open across Text
+            // chunks and close on the next tint change or at End(CodeBlock).
+            let appended = builder.open_diff_row == Some(background);
+            if appended {
+                builder.push_text("\n", line_start..line_start);
+            } else {
+                if builder.open_diff_row.take().is_some() {
+                    builder.pop_div();
+                }
+                builder.push_div(
+                    div()
+                        .w_full()
+                        .when_some(background, |row, background| row.bg(background)),
+                    &(line_start..line_start + line.len()),
+                    markdown_end,
+                );
+                builder.open_diff_row = Some(background);
+            }
+            if content.is_empty() {
+                if !appended {
+                    // A row that opens on an empty line would collapse to zero
+                    // height; a space keeps it one line tall without pixel math.
+                    builder.push_text(" ", line_start..line_start);
+                }
+            } else if tints.inner_language {
+                // Render the diff marker as its own colored run and highlight
+                // the rest of the line with the inner language, so the code
+                // keeps its normal syntax colors under the tint. (Per-line
+                // highlighting; multi-line constructs like block comments may
+                // lose color, which diffs inherently risk anyway.)
+                let (marker_len, marker_color) =
+                    if content.starts_with("+++") || content.starts_with("---") {
+                        (0, None)
+                    } else if content.starts_with('+') {
+                        (1, Some(tints.added_foreground))
+                    } else if content.starts_with('-') {
+                        (1, Some(tints.deleted_foreground))
+                    } else if content.starts_with("@@") {
+                        // The whole hunk header is diff syntax, not code.
+                        (content.len(), Some(tints.hunk_foreground))
+                    } else {
+                        (0, None)
+                    };
+                if marker_len > 0 {
+                    if let Some(color) = marker_color {
+                        builder.push_text_style(TextStyleRefinement {
+                            color: Some(color),
+                            ..Default::default()
+                        });
+                    }
+                    builder.push_text(&content[..marker_len], line_start..line_start + marker_len);
+                    if marker_color.is_some() {
+                        builder.pop_text_style();
+                    }
+                }
+                if marker_len < content.len() {
+                    builder.push_text(
+                        &content[marker_len..],
+                        line_start + marker_len..line_start + content.len(),
+                    );
+                }
+            } else {
+                builder.push_text(content, line_start..line_start + content.len());
+            }
+            // Skip past the newline so selection/copy mapping stays monotonic.
+            builder.current_source_index = line_start + line.len();
+        }
     }
 
     /// Emit `text`, replacing resolvable emoji shortcodes with their inline SVG
@@ -2054,8 +2165,57 @@ impl Element for MarkdownElement {
                                         });
 
                                     builder.push_text_style(self.style.code_block.text.to_owned());
-                                    builder.push_code_block(language);
+                                    builder.push_code_block(language.clone());
                                     builder.push_div(code_block, range, markdown_end);
+
+                                    // GitHub-style diff row tints: each line of a
+                                    // ```diff block renders as its own row div
+                                    // whose background tints added/removed/hunk
+                                    // lines (see `push_diff_lines`). The tint is
+                                    // the row's own background, so it can never
+                                    // drift out of alignment with the text the
+                                    // way absolutely-positioned bands (computed
+                                    // from a guessed line height) did.
+                                    //
+                                    // ```diff — lines highlight with the Diff
+                                    // grammar. ```diff <language> — lines strip
+                                    // their +/- marker and highlight with the
+                                    // inner language, so code keeps its normal
+                                    // syntax colors under the tints.
+                                    let diff_fence_inner_language = match kind {
+                                        CodeBlockKind::FencedLang(name)
+                                            if name.as_ref() == "diff" =>
+                                        {
+                                            Some(false)
+                                        }
+                                        CodeBlockKind::FencedLang(name)
+                                            if name.starts_with("diff ")
+                                                && !name["diff ".len()..].trim().is_empty() =>
+                                        {
+                                            Some(true)
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(inner_language) = diff_fence_inner_language {
+                                        let status = cx.theme().status();
+                                        builder.diff_block_tints = Some(DiffBlockTints {
+                                            added: status.created.opacity(0.12),
+                                            deleted: status.deleted.opacity(0.12),
+                                            hunk: status.info.opacity(0.12),
+                                            added_foreground: status.created,
+                                            deleted_foreground: status.deleted,
+                                            hunk_foreground: status.info,
+                                            inner_language,
+                                        });
+                                        // Rows stack in a column; `min_w_full`
+                                        // stretches them to the block's width
+                                        // even when every line is short.
+                                        builder.push_div(
+                                            div().flex().flex_col().min_w_full(),
+                                            range,
+                                            markdown_end,
+                                        );
+                                    }
                                 }
                                 (CodeBlockRenderer::Custom { .. }, _) => {}
                             }
@@ -2481,6 +2641,14 @@ impl Element for MarkdownElement {
                     MarkdownTagEnd::CodeBlock => {
                         builder.trim_trailing_newline();
 
+                        // Pop the open row and the row column pushed for
+                        // ```diff blocks.
+                        if builder.diff_block_tints.take().is_some() {
+                            if builder.open_diff_row.take().is_some() {
+                                builder.pop_div();
+                            }
+                            builder.pop_div();
+                        }
                         builder.pop_div();
                         builder.pop_code_block();
                         builder.pop_text_style();
@@ -2579,6 +2747,10 @@ impl Element for MarkdownElement {
                 },
                 MarkdownEvent::Text => {
                     let text = &parsed_markdown.source[range.clone()];
+                    if builder.diff_block_tints.is_some() {
+                        self.push_diff_lines(&mut builder, text, range.clone(), markdown_end);
+                        continue;
+                    }
                     // Inline emoji icons can only flow between word boxes, so
                     // they're limited to wrapping containers (which the block
                     // scans above enable whenever text contains a shortcode).
@@ -2934,6 +3106,21 @@ impl TableState {
     }
 }
 
+/// Row tint colors for rendering a ```diff code block GitHub-style.
+#[derive(Clone, Copy)]
+struct DiffBlockTints {
+    added: Hsla,
+    deleted: Hsla,
+    hunk: Hsla,
+    added_foreground: Hsla,
+    deleted_foreground: Hsla,
+    hunk_foreground: Hsla,
+    /// `true` for a ```diff <language> fence: the +/- marker renders as its
+    /// own colored run and the rest of the line highlights with the inner
+    /// language; `false` for plain ```diff (Diff-grammar highlighting).
+    inner_language: bool,
+}
+
 struct MarkdownElementBuilder {
     div_stack: Vec<AnyDiv>,
     rendered_lines: Vec<RenderedLine>,
@@ -2944,6 +3131,12 @@ struct MarkdownElementBuilder {
     /// When set, text is emitted as one element per word so the current div
     /// (a `flex_wrap` row) can wrap between words and around inline math.
     wrap_words: bool,
+    /// When set (inside a ```diff code block), code text renders as one row
+    /// div per line with these tint backgrounds (see `push_diff_lines`).
+    diff_block_tints: Option<DiffBlockTints>,
+    /// The background of the currently open diff row div, if one is open —
+    /// consecutive same-tint lines share a row (see `push_diff_lines`).
+    open_diff_row: Option<Option<Hsla>>,
     /// When set (inside a footnote/source definition), paragraphs use tight
     /// spacing so the sources list isn't stretched out by body paragraph margins.
     in_footnote: bool,
@@ -2991,6 +3184,8 @@ impl MarkdownElementBuilder {
             rendered_footnote_refs: Vec::new(),
             current_source_index: 0,
             wrap_words: false,
+            diff_block_tints: None,
+            open_diff_row: None,
             in_footnote: false,
             open_centers: 0,
             html_comment: false,
