@@ -2741,6 +2741,13 @@ impl Element for MarkdownElement {
                         self.push_diff_lines(&mut builder, text, range.clone(), markdown_end);
                         continue;
                     }
+                    let (text, range) = if builder.trim_leading_space {
+                        builder.trim_leading_space = false;
+                        let trimmed = text.trim_start_matches(' ');
+                        (trimmed, range.start + (text.len() - trimmed.len())..range.end)
+                    } else {
+                        (text, range.clone())
+                    };
                     // Inline emoji icons can only flow between word boxes, so
                     // they're limited to wrapping containers (which the block
                     // scans above enable whenever text contains a shortcode).
@@ -2815,6 +2822,9 @@ impl Element for MarkdownElement {
                         } else {
                             builder.push_text("\n", range.clone());
                         }
+                        // Source text often pads `<br>` with a space; on the
+                        // new line it would render as a leading indent.
+                        builder.trim_leading_space = true;
                         continue;
                     }
                     builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
@@ -3140,6 +3150,9 @@ struct MarkdownElementBuilder {
     /// Inside a table cell with `<br>` breaks, whose lines render as stacked
     /// row divs; a `<br>` closes the open row and starts the next.
     in_multiline_cell: bool,
+    /// Swallow leading spaces from the next text run (set after a `<br>`, whose
+    /// padding space would otherwise indent the new line).
+    trim_leading_space: bool,
     /// When set (inside a footnote/source definition), paragraphs use tight
     /// spacing so the sources list isn't stretched out by body paragraph margins.
     in_footnote: bool,
@@ -3190,6 +3203,7 @@ impl MarkdownElementBuilder {
             diff_block_tints: None,
             open_diff_row: None,
             in_multiline_cell: false,
+            trim_leading_space: false,
             in_footnote: false,
             open_centers: 0,
             html_comment: false,
