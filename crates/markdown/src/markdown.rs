@@ -266,10 +266,20 @@ pub struct Markdown {
     copied_code_blocks: HashSet<ElementId>,
     code_block_scroll_handles: BTreeMap<usize, ScrollHandle>,
     table_scroll_handles: BTreeMap<usize, ScrollHandle>,
+    /// Active sort per table (keyed by the table's source start), toggled by
+    /// clicking a header cell. Rows are re-ordered at render time.
+    table_sorts: BTreeMap<usize, TableSort>,
     context_menu_link: Option<SharedString>,
     context_menu_selected_text: Option<String>,
     search_highlights: Vec<Range<usize>>,
     active_search_highlight: Option<usize>,
+}
+
+/// A table's active sort: which column, and which direction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TableSort {
+    pub column: usize,
+    pub descending: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -439,6 +449,7 @@ impl Markdown {
             copied_code_blocks: HashSet::default(),
             code_block_scroll_handles: BTreeMap::default(),
             table_scroll_handles: BTreeMap::default(),
+            table_sorts: BTreeMap::default(),
             context_menu_link: None,
             context_menu_selected_text: None,
             search_highlights: Vec::new(),
@@ -482,6 +493,41 @@ impl Markdown {
 
     fn retain_table_scroll_handles(&mut self, ids: &HashSet<usize>) {
         self.table_scroll_handles.retain(|id, _| ids.contains(id));
+        self.table_sorts.retain(|id, _| ids.contains(id));
+    }
+
+    fn table_sort(&self, table: usize) -> Option<TableSort> {
+        self.table_sorts.get(&table).copied()
+    }
+
+    /// Cycle a header click: unsorted → descending → ascending → unsorted.
+    /// Clicking a different column starts its cycle fresh.
+    fn toggle_table_sort(&mut self, table: usize, column: usize, cx: &mut Context<Self>) {
+        let next = match self.table_sorts.get(&table) {
+            Some(sort) if sort.column == column => {
+                if sort.descending {
+                    Some(TableSort {
+                        column,
+                        descending: false,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => Some(TableSort {
+                column,
+                descending: true,
+            }),
+        };
+        match next {
+            Some(sort) => {
+                self.table_sorts.insert(table, sort);
+            }
+            None => {
+                self.table_sorts.remove(&table);
+            }
+        }
+        cx.notify();
     }
 
     fn clear_code_block_scroll_handles(&mut self) {
@@ -1004,6 +1050,194 @@ pub struct MarkdownElement {
     formula_resolver: Option<Box<dyn Fn(&str) -> String>>,
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
+}
+
+/// Reorders each sorted table's body-row event spans according to its
+/// [`TableSort`]. Events keep their original source ranges, so selection,
+/// copy, and click-to-source keep working on the sorted view.
+fn apply_table_sorts(
+    events: &[(Range<usize>, MarkdownEvent)],
+    source: &str,
+    sorts: &BTreeMap<usize, TableSort>,
+    formula_resolver: Option<&dyn Fn(&str) -> String>,
+) -> Vec<(Range<usize>, MarkdownEvent)> {
+    let mut output = Vec::with_capacity(events.len());
+    let mut index = 0;
+    while index < events.len() {
+        let (range, event) = &events[index];
+        let sort = match event {
+            MarkdownEvent::Start(MarkdownTag::Table(_)) => sorts.get(&range.start).copied(),
+            _ => None,
+        };
+        let Some(sort) = sort else {
+            output.push(events[index].clone());
+            index += 1;
+            continue;
+        };
+
+        let mut end = index;
+        for (offset, (_, event)) in events[index..].iter().enumerate() {
+            if matches!(event, MarkdownEvent::End(MarkdownTagEnd::Table)) {
+                end = index + offset;
+                break;
+            }
+        }
+
+        // Body rows only: the header lives in TableHead, which has no
+        // TableRow events.
+        let mut rows: Vec<(usize, usize)> = Vec::new();
+        let mut row_start = None;
+        for position in index..=end {
+            match &events[position].1 {
+                MarkdownEvent::Start(MarkdownTag::TableRow) => row_start = Some(position),
+                MarkdownEvent::End(MarkdownTagEnd::TableRow) => {
+                    if let Some(start) = row_start.take() {
+                        rows.push((start, position));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if rows.is_empty() {
+            output.extend_from_slice(&events[index..=end]);
+            index = end + 1;
+            continue;
+        }
+
+        let mut keyed: Vec<(String, (usize, usize))> = rows
+            .iter()
+            .map(|&(start, end)| {
+                let mut column = 0usize;
+                let mut in_target = false;
+                let mut text = String::new();
+                for position in start..=end {
+                    match &events[position].1 {
+                        MarkdownEvent::Start(MarkdownTag::TableCell) => {
+                            in_target = column == sort.column;
+                        }
+                        MarkdownEvent::End(MarkdownTagEnd::TableCell) => {
+                            column += 1;
+                            in_target = false;
+                        }
+                        MarkdownEvent::Text if in_target => {
+                            text.push_str(&source[events[position].0.clone()]);
+                        }
+                        MarkdownEvent::Code if in_target => {
+                            let content = &source[events[position].0.clone()];
+                            // Sort formula cells by their computed value —
+                            // the same thing the user sees — not the formula.
+                            if let Some(resolver) = formula_resolver
+                                && let Some(expression) = content.strip_prefix("= ")
+                            {
+                                text.push_str(&resolver(expression));
+                            } else {
+                                text.push_str(content);
+                            }
+                        }
+                        MarkdownEvent::SubstitutedText(substituted) if in_target => {
+                            text.push_str(substituted);
+                        }
+                        _ => {}
+                    }
+                }
+                (text.trim().to_string(), (start, end))
+            })
+            .collect();
+        keyed.sort_by(|(left, _), (right, _)| {
+            let left_number = table_sort_date(left).or_else(|| table_sort_number(left));
+            let right_number = table_sort_date(right).or_else(|| table_sort_number(right));
+            // Rank groups don't reverse with the direction: numbers stay above
+            // text, and blank/error cells stay at the bottom (as in
+            // spreadsheets) whether sorting ascending or descending.
+            let rank = |key: &str, number: &Option<f64>| -> u8 {
+                if key.is_empty() || key.starts_with("#ERROR") {
+                    2
+                } else if number.is_some() {
+                    0
+                } else {
+                    1
+                }
+            };
+            rank(left, &left_number)
+                .cmp(&rank(right, &right_number))
+                .then_with(|| {
+                    let ordering = match (left_number, right_number) {
+                        (Some(left), Some(right)) => {
+                            left.partial_cmp(&right).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                        _ => left.to_lowercase().cmp(&right.to_lowercase()),
+                    };
+                    if sort.descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    }
+                })
+        });
+
+        let first_row = rows[0].0;
+        let last_row_end = rows[rows.len() - 1].1;
+        output.extend_from_slice(&events[index..first_row]);
+        for &(_, (start, end)) in &keyed {
+            output.extend_from_slice(&events[start..=end]);
+        }
+        output.extend_from_slice(&events[last_row_end + 1..=end]);
+        index = end + 1;
+    }
+    output
+}
+
+/// Sort key for a date-shaped cell: `MM/DD/YYYY`, `M/D/YY`, and `YYYY-MM-DD`
+/// map to `year*10000 + month*100 + day`, so dates order chronologically
+/// instead of by their leading number (which would sort US dates by month).
+fn table_sort_date(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let separator = if text.contains('/') { '/' } else { '-' };
+    let parts: Vec<&str> = text.split(separator).collect();
+    if parts.len() != 3
+        || !parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|char| char.is_ascii_digit()))
+    {
+        return None;
+    }
+    let numbers: Vec<u32> = parts.iter().filter_map(|part| part.parse().ok()).collect();
+    if numbers.len() != 3 {
+        return None;
+    }
+    let (year, month, day) = if parts[0].len() == 4 {
+        (numbers[0], numbers[1], numbers[2])
+    } else {
+        let year = match numbers[2] {
+            year if year < 50 => year + 2000,
+            year if year < 100 => year + 1900,
+            year => year,
+        };
+        (year, numbers[0], numbers[1])
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some((year * 10000 + month * 100 + day) as f64)
+}
+
+/// Numeric sort key for a cell, tolerating `$`, `,`, `%` and surrounding text
+/// like units — `$6,008.89` and `130 crosses` both yield numbers.
+fn table_sort_number(text: &str) -> Option<f64> {
+    let cleaned: String = text
+        .chars()
+        .filter(|char| !matches!(char, '$' | ',' | '%'))
+        .collect();
+    let cleaned = cleaned.trim();
+    let numeric_prefix: &str = &cleaned[..cleaned
+        .char_indices()
+        .take_while(|(index, char)| {
+            char.is_ascii_digit() || *char == '.' || (*index == 0 && *char == '-')
+        })
+        .map(|(index, char)| index + char.len_utf8())
+        .last()
+        .unwrap_or(0)];
+    numeric_prefix.parse().ok()
 }
 
 /// Parses an emoji shortcode (`:name` or `:name:`) at the start of `token`,
@@ -1916,7 +2150,21 @@ impl Element for MarkdownElement {
                 markdown.mermaid_state.clone(),
             )
         };
-        let markdown_end = if let Some(last) = parsed_markdown.events.last() {
+        // With any active table sort, render a permuted copy of the events —
+        // the source itself is untouched.
+        let table_sorts = self.markdown.read(cx).table_sorts.clone();
+        let sorted_events = (!table_sorts.is_empty()).then(|| {
+            apply_table_sorts(
+                &parsed_markdown.events,
+                parsed_markdown.source(),
+                &table_sorts,
+                self.formula_resolver.as_deref(),
+            )
+        });
+        let events: &[(Range<usize>, MarkdownEvent)] =
+            sorted_events.as_deref().unwrap_or(&parsed_markdown.events);
+
+        let markdown_end = if let Some(last) = events.last() {
             last.0.end
         } else {
             0
@@ -1930,7 +2178,7 @@ impl Element for MarkdownElement {
         // A `<center>`/`</center>` HTML block toggles centering instead of
         // pushing a div, so its matching `End(HtmlBlock)` must skip the pop.
         let mut skip_html_block_pop = false;
-        for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
+        for (index, (range, event)) in events.iter().enumerate() {
             // Skip alt text for images that rendered
             if let Some(current_img_block_range) = &current_img_block_range
                 && current_img_block_range.end > range.end
@@ -1978,7 +2226,7 @@ impl Element for MarkdownElement {
                             // Obsidian-style size: `![[image|600]]` / `![[image|600x400]]`.
                             let (width, height) = image_size_override(
                                 link_type,
-                                &parsed_markdown.events,
+                                events,
                                 index,
                                 &parsed_markdown.source,
                             );
@@ -2004,7 +2252,7 @@ impl Element for MarkdownElement {
                             // Wrap into per-word boxes when the paragraph must flow
                             // an inline element: inline math, a wikilink whose
                             // page icon is shown before it, or an emoji shortcode.
-                            let wrap_inline = parsed_markdown.events[index + 1..]
+                            let wrap_inline = events[index + 1..]
                                 .iter()
                                 .take_while(|(_, event)| {
                                     !matches!(
@@ -2257,7 +2505,7 @@ impl Element for MarkdownElement {
                         MarkdownTag::Item => {
                             let bullet =
                                 if let Some((task_range, MarkdownEvent::TaskListMarker(checked))) =
-                                    parsed_markdown.events.get(index.saturating_add(1))
+                                    events.get(index.saturating_add(1))
                                 {
                                     let source = &parsed_markdown.source()[range.clone()];
                                     let checked = *checked;
@@ -2310,7 +2558,7 @@ impl Element for MarkdownElement {
                             // item's content row to become a wrapping flex row.
                             let mut depth = 0usize;
                             let mut item_has_inline_math = false;
-                            for (event_range, event) in &parsed_markdown.events[index + 1..] {
+                            for (event_range, event) in &events[index + 1..] {
                                 match event {
                                     MarkdownEvent::InlineMath(_) if depth == 0 => {
                                         item_has_inline_math = true;
@@ -2461,6 +2709,7 @@ impl Element for MarkdownElement {
                         MarkdownTag::MetadataBlock(_) => {}
                         MarkdownTag::Table(alignments) => {
                             builder.table.start(alignments.clone());
+                            builder.table.source_start = range.start;
 
                             let column_count = alignments.len() as u16;
                             let table = div()
@@ -2541,7 +2790,7 @@ impl Element for MarkdownElement {
                             // columns still size to the cell's content.
                             let mut cell_wraps = false;
                             let mut cell_has_line_break = false;
-                            for (event_range, event) in parsed_markdown.events[index + 1..]
+                            for (event_range, event) in events[index + 1..]
                                 .iter()
                                 .take_while(|(_, event)| {
                                     !matches!(
@@ -2571,8 +2820,7 @@ impl Element for MarkdownElement {
                                     _ => {}
                                 }
                             }
-                            builder.push_div(
-                                div()
+                            let cell = div()
                                     .when(col_index > 0, |this| this.border_l_1())
                                     .when(row_index > 0, |this| this.border_t_1())
                                     .border_color(cx.theme().colors().border)
@@ -2603,10 +2851,29 @@ impl Element for MarkdownElement {
                                         } else {
                                             this.flex().flex_row().items_baseline()
                                         }
-                                    }),
-                                range,
-                                markdown_end,
-                            );
+                                    });
+                            // Header cells are clickable sort toggles:
+                            // unsorted → descending → ascending → unsorted.
+                            let cell: AnyDiv = if is_header {
+                                let markdown = self.markdown.clone();
+                                let table_start = builder.table.source_start;
+                                cell.id(ElementId::Name(
+                                    format!("table-sort-{table_start}-{col_index}").into(),
+                                ))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .cursor_pointer()
+                                .on_click(move |_, _, cx| {
+                                    markdown.update(cx, |markdown, cx| {
+                                        markdown.toggle_table_sort(table_start, col_index, cx);
+                                    });
+                                })
+                                .into()
+                            } else {
+                                cell.into()
+                            };
+                            builder.push_div(cell, range, markdown_end);
                             builder.wrap_words = cell_wraps;
                             if cell_wraps && cell_has_line_break {
                                 builder.in_multiline_cell = true;
@@ -2729,6 +2996,25 @@ impl Element for MarkdownElement {
                     }
                     MarkdownTagEnd::TableCell => {
                         builder.replace_pending_checkbox(range);
+                        // Chevron on the actively sorted header column.
+                        if builder.table.in_head
+                            && let Some(sort) =
+                                self.markdown.read(cx).table_sort(builder.table.source_start)
+                            && sort.column == builder.table.col_index
+                        {
+                            builder.flush_text();
+                            let icon = Icon::new(if sort.descending {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronUp
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted);
+                            builder.push_inline_icon(
+                                div().ml_1().flex_none().child(icon).into_any_element(),
+                                range.end..range.end,
+                            );
+                        }
                         builder.wrap_words = false;
                         // Pop the open line row of a `<br>` multi-line cell.
                         if builder.in_multiline_cell {
@@ -3100,6 +3386,8 @@ struct TableState {
     in_head: bool,
     row_index: usize,
     col_index: usize,
+    /// The table's source start offset — its identity for sort state.
+    source_start: usize,
 }
 
 impl TableState {
