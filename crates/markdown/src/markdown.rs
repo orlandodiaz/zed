@@ -998,6 +998,10 @@ pub struct MarkdownElement {
     /// Given an emoji shortcode name (the `check` in `:check` / `:check:`),
     /// returns the path to an SVG to render inline in place of the shortcode.
     emoji_icon_resolver: Option<Box<dyn Fn(&str) -> Option<PathBuf>>>,
+    /// Given a formula (the text after the `= ` trigger of an inline code
+    /// span), returns its display value; the span renders as that value
+    /// instead of a code chip.
+    formula_resolver: Option<Box<dyn Fn(&str) -> String>>,
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
 }
@@ -1037,6 +1041,7 @@ impl MarkdownElement {
             image_resolver: None,
             link_icon_resolver: None,
             emoji_icon_resolver: None,
+            formula_resolver: None,
             show_root_block_markers: false,
             autoscroll: AutoscrollBehavior::Propagate,
         }
@@ -1122,6 +1127,11 @@ impl MarkdownElement {
         resolver: impl Fn(&str) -> Option<PathBuf> + 'static,
     ) -> Self {
         self.emoji_icon_resolver = Some(Box::new(resolver));
+        self
+    }
+
+    pub fn formula_resolver(mut self, resolver: impl Fn(&str) -> String + 'static) -> Self {
+        self.formula_resolver = Some(Box::new(resolver));
         self
     }
 
@@ -2761,6 +2771,18 @@ impl Element for MarkdownElement {
                     builder.push_text(text, range.clone());
                 }
                 MarkdownEvent::Code => {
+                    // An inline code span starting with `= ` is a formula
+                    // (Dataview-style trigger): render its computed value as
+                    // plain text in place of the code chip. Copying still
+                    // yields the formula, since selection maps to the source.
+                    if let Some(resolver) = self.formula_resolver.as_ref()
+                        && let Some(expression) =
+                            parsed_markdown.source[range.clone()].strip_prefix("= ")
+                    {
+                        let value = resolver(expression);
+                        builder.push_text(&value, range.clone());
+                        continue;
+                    }
                     // In a wrapping (per-word) line, render inline code as its own
                     // box so it can take `inline_code.font_size` — a shaped line is
                     // locked to one size, so the run-level size is otherwise lost.

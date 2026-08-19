@@ -1,6 +1,7 @@
 use gpui::{App, Global, actions};
 use workspace::Workspace;
 
+pub mod formulas;
 pub mod markdown_preview_settings;
 pub mod markdown_preview_view;
 

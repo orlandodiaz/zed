@@ -68,6 +68,18 @@ struct MarkdownIndexCache {
 
 impl Global for MarkdownIndexCache {}
 
+/// Whether frontmatter properties panels are shown — shared by every preview
+/// so the toolbar toggle persists across pages (for the app session).
+#[derive(Default)]
+struct ShowFrontmatter(bool);
+
+impl Global for ShowFrontmatter {}
+
+fn show_frontmatter(cx: &App) -> bool {
+    cx.try_global::<ShowFrontmatter>()
+        .is_some_and(|setting| setting.0)
+}
+
 pub struct MarkdownPreviewView {
     workspace: WeakEntity<Workspace>,
     active_editor: Option<EditorState>,
@@ -97,6 +109,11 @@ pub struct MarkdownPreviewView {
     /// This view's handle on the current worktree's shared emoji index: a
     /// shortcode name → SVG path, so `:check` renders `assets/check.svg` inline.
     emoji_icon_index: Rc<HashMap<String, PathBuf>>,
+    /// `FIELD(...)` values for inline formulas, rebuilt from the page's
+    /// frontmatter and two-column table rows on every content update.
+    formula_fields: Rc<HashMap<String, String>>,
+    /// The page's frontmatter pairs, shown as a properties panel when toggled.
+    frontmatter: Rc<Vec<(String, String)>>,
     /// The worktree `image_index`/`link_icon_index` currently point at. Switching
     /// to a file in a different worktree re-points them (from the shared cache).
     indexed_worktree: Option<WorktreeId>,
@@ -424,6 +441,8 @@ impl MarkdownPreviewView {
                 image_index: Rc::new(HashMap::new()),
                 link_icon_index: Rc::new(HashMap::new()),
                 emoji_icon_index: Rc::new(HashMap::new()),
+                formula_fields: Rc::new(HashMap::new()),
+                frontmatter: Rc::new(Vec::new()),
                 indexed_worktree: None,
                 index_rebuild_task: None,
                 _project_subscription: None,
@@ -585,11 +604,82 @@ impl MarkdownPreviewView {
                 } else {
                     strip_footnotes(&contents)
                 };
-                Some((SharedString::from(contents), selection_start))
+                let formula_fields = crate::formulas::build_field_index(&contents);
+                let frontmatter = crate::formulas::frontmatter_pairs(&contents);
+                // Cross-page `FIELD("page", "field")` references: resolve each
+                // referenced page to a file now (worktrees are only iterated
+                // when such references exist); their contents load below,
+                // outside this update closure, so evaluation itself never
+                // touches the filesystem.
+                let referenced = crate::formulas::referenced_pages(&contents);
+                let mut cross_pages: Vec<(String, std::path::PathBuf)> = Vec::new();
+                let mut fs = None;
+                if !referenced.is_empty()
+                    && let Some(workspace) = view.workspace.upgrade()
+                {
+                    let project = workspace.read(cx).project().read(cx);
+                    fs = Some(project.fs().clone());
+                    for page in referenced {
+                        let file_name = format!("{page}.md");
+                        let path = project.worktrees(cx).find_map(|worktree| {
+                            let worktree = worktree.read(cx);
+                            // include_ignored: wiki notes are often gitignored.
+                            worktree.files(true, 0).find_map(|entry| {
+                                let name = entry.path.file_name()?;
+                                name.eq_ignore_ascii_case(&file_name)
+                                    .then(|| worktree.absolutize(&entry.path))
+                            })
+                        });
+                        if let Some(path) = path {
+                            cross_pages.push((page, path));
+                        }
+                    }
+                }
+                Some((
+                    SharedString::from(contents),
+                    selection_start,
+                    formula_fields,
+                    frontmatter,
+                    cross_pages,
+                    fs,
+                ))
             })?;
 
+            let update = match update {
+                Some((
+                    contents,
+                    selection_start,
+                    mut formula_fields,
+                    frontmatter,
+                    cross_pages,
+                    fs,
+                )) => {
+                    if let Some(fs) = fs {
+                        for (page, path) in cross_pages {
+                            if let Ok(source) = fs.load(&path).await {
+                                for (key, value) in crate::formulas::build_field_index(&source) {
+                                    formula_fields.insert(
+                                        crate::formulas::cross_page_key(&page, &key),
+                                        value,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Some((
+                        contents,
+                        selection_start,
+                        Rc::new(formula_fields),
+                        Rc::new(frontmatter),
+                    ))
+                }
+                None => None,
+            };
+
             view.update(cx, move |view, cx| {
-                if let Some((contents, selection_start)) = update {
+                if let Some((contents, selection_start, formula_fields, frontmatter)) = update {
+                    view.formula_fields = formula_fields;
+                    view.frontmatter = frontmatter;
                     view.markdown.update(cx, |markdown, cx| {
                         markdown.reset(contents, cx);
                     });
@@ -1084,6 +1174,10 @@ impl MarkdownPreviewView {
         .emoji_icon_resolver({
             let emoji_icon_index = self.emoji_icon_index.clone();
             move |name| emoji_icon_index.get(&name.to_ascii_lowercase()).cloned()
+        })
+        .formula_resolver({
+            let formula_fields = self.formula_fields.clone();
+            move |expression| crate::formulas::evaluate(expression, &formula_fields)
         })
         // (resolver returns the icon SVG path; the markdown element renders it as
         // crisp vector geometry rather than a rasterized image.)
@@ -1974,6 +2068,43 @@ impl Item for MarkdownPreviewView {
     }
 }
 
+impl MarkdownPreviewView {
+    /// The frontmatter properties panel (Obsidian-style): muted key–value
+    /// rows under the title, shown when toggled from the toolbar.
+    fn frontmatter_panel(&self, cx: &App) -> Option<gpui::AnyElement> {
+        if !show_frontmatter(cx) || self.frontmatter.is_empty() {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        Some(
+            v_flex()
+                .mb_3()
+                .pb_2()
+                .gap_0p5()
+                .border_b_1()
+                .border_color(colors.border_variant)
+                .text_size(px(13.))
+                .children(self.frontmatter.iter().map(|(key, value)| {
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .child(
+                            div()
+                                .min_w(rems(9.))
+                                .text_color(colors.text_muted)
+                                .child(SharedString::from(key.clone())),
+                        )
+                        .child(
+                            div()
+                                .text_color(colors.text)
+                                .child(SharedString::from(value.clone())),
+                        )
+                }))
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for MarkdownPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Headings (and other rems-based sizes) scale with the rem size; body
@@ -2029,6 +2160,7 @@ impl Render for MarkdownPreviewView {
                                     .child(title),
                             )
                     }))
+                    .children(self.frontmatter_panel(cx))
                     .child(WithRemSize::new(rem_size).child({
                         let markdown_element = self.render_markdown_element(window, cx);
                         let markdown = self.markdown.clone();
@@ -2058,6 +2190,21 @@ impl Render for MarkdownPreviewView {
                     .right_4()
                     .flex()
                     .gap_1()
+                    .child(
+                        IconButton::new("markdown-toggle-frontmatter", IconName::Info)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(show_frontmatter(cx))
+                            .tooltip(Tooltip::text(if show_frontmatter(cx) {
+                                "Hide properties"
+                            } else {
+                                "Show properties"
+                            }))
+                            .on_click(cx.listener(|_view, _, _window, cx| {
+                                let shown = show_frontmatter(cx);
+                                cx.set_global(ShowFrontmatter(!shown));
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         IconButton::new("markdown-toggle-footnotes", IconName::Hash)
                             .icon_size(IconSize::Small)
