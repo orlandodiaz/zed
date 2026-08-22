@@ -101,6 +101,149 @@ pub fn frontmatter_pairs(source: &str) -> Vec<(String, String)> {
     pairs
 }
 
+/// Formats a US phone number as `(AAA) BBB-CCCC` from raw digits, an
+/// optionally `1`-prefixed number, or an already-formatted value (idempotent).
+/// Anything else — international `+…` numbers included — passes through.
+pub(crate) fn format_phone(value: &str) -> String {
+    let value = value.trim();
+    if value.starts_with('+') {
+        return value.to_string();
+    }
+    let digits: String = value.chars().filter(|char| char.is_ascii_digit()).collect();
+    let digits = digits.strip_prefix('1').filter(|_| digits.len() == 11).unwrap_or(&digits);
+    if digits.len() != 10 {
+        return value.to_string();
+    }
+    format!("({}) {}-{}", &digits[..3], &digits[3..6], &digits[6..])
+}
+
+/// Age in whole years for a date-formatted value, `None` when unparseable —
+/// the computed `AGE(...)` view column.
+pub(crate) fn age_of(value: &str) -> Option<f64> {
+    let date = parse_date(value)?;
+    date_difference(date, Local::now().date_naive(), "Y").ok()
+}
+
+pub(crate) fn age_months_of(value: &str) -> Option<f64> {
+    let date = parse_date(value)?;
+    date_difference(date, Local::now().date_naive(), "M").ok()
+}
+
+/// Key under which a row's column value is exposed to `where:` conditions.
+pub fn col_key(name: &str) -> String {
+    format!("col\u{0}{}", name.trim().to_ascii_lowercase())
+}
+
+/// Evaluates a table `where:` condition to a boolean. `fields` combines the
+/// page's fields with the row's `col_key` entries.
+pub fn evaluate_condition(
+    expression: &str,
+    fields: &HashMap<String, String>,
+) -> Result<bool, String> {
+    let tokens = tokenize(expression)?;
+    let value = (Parser {
+        tokens,
+        position: 0,
+        fields,
+        lenient_columns: false,
+    })
+    .parse()?;
+    value.to_bool()
+}
+
+/// Like [`evaluate_condition`], but a `COL()` naming a field the record
+/// doesn't carry evaluates to empty text instead of erroring — database
+/// records legitimately lack fields, and a filter like
+/// `COL("Last name") <> ""` must treat absence as empty.
+pub fn evaluate_view_condition(
+    expression: &str,
+    fields: &HashMap<String, String>,
+) -> Result<bool, String> {
+    let tokens = tokenize(expression)?;
+    let value = (Parser {
+        tokens,
+        position: 0,
+        fields,
+        lenient_columns: true,
+    })
+    .parse()?;
+    value.to_bool()
+}
+
+/// Excel-style database aggregate functions, evaluated over a folder
+/// database's records (precomputed at page-update time, like cross-page
+/// `FIELD()` values).
+pub const DATABASE_AGGREGATES: [&str; 6] =
+    ["DSUM", "DCOUNT", "DAVERAGE", "DMEDIAN", "DMIN", "DMAX"];
+
+/// Key under which a precomputed database aggregate is stored.
+pub fn database_aggregate_key(
+    function: &str,
+    database: &str,
+    field: Option<&str>,
+    criteria: Option<&str>,
+) -> String {
+    format!(
+        "db\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+        function.trim().to_ascii_uppercase(),
+        database.trim().to_ascii_lowercase(),
+        field.unwrap_or_default().trim().to_ascii_lowercase(),
+        criteria.unwrap_or_default().trim()
+    )
+}
+
+/// Database aggregates referenced with literal arguments, e.g.
+/// `DSUM("Credit cards", "Credit limit")`, so the preview can load those
+/// databases and precompute the values ahead of evaluation.
+pub fn referenced_database_aggregates(
+    source: &str,
+) -> Vec<(String, String, Option<String>, Option<String>)> {
+    // Reads a leading quoted literal (either quote kind), returning it and
+    // the remaining text.
+    fn quoted(text: &str) -> Option<(String, &str)> {
+        let text = text.trim_start();
+        let quote = text.chars().next().filter(|char| matches!(char, '"' | '\''))?;
+        let rest = &text[1..];
+        let end = rest.find(quote)?;
+        Some((rest[..end].trim().to_string(), &rest[end + 1..]))
+    }
+    let mut references = Vec::new();
+    let upper = source.to_ascii_uppercase();
+    for function in DATABASE_AGGREGATES {
+        let needle = format!("{function}(");
+        let mut search = 0;
+        while let Some(found) = upper[search..].find(&needle) {
+            let after = search + found + needle.len();
+            search = after;
+            let Some((database, rest)) = quoted(&source[after..]) else {
+                continue;
+            };
+            if database.is_empty() {
+                continue;
+            }
+            let mut field = None;
+            let mut criteria = None;
+            let mut rest = rest.trim_start();
+            if let Some(tail) = rest.strip_prefix(',')
+                && let Some((value, tail)) = quoted(tail)
+            {
+                field = Some(value);
+                rest = tail.trim_start();
+                if let Some(tail) = rest.strip_prefix(',')
+                    && let Some((value, _)) = quoted(tail)
+                {
+                    criteria = Some(value);
+                }
+            }
+            let entry = (function.to_string(), database, field, criteria);
+            if !references.contains(&entry) {
+                references.push(entry);
+            }
+        }
+    }
+    references
+}
+
 /// Key under which a cross-page field is stored in the combined index:
 /// `page\0field`, both lowercased. `\0` can't appear in either name.
 pub fn cross_page_key(page: &str, field: &str) -> String {
@@ -148,7 +291,14 @@ pub fn evaluate(expression: &str, fields: &HashMap<String, String>) -> String {
         Ok(tokens) => tokens,
         Err(message) => return format!("#ERROR: {message}"),
     };
-    match (Parser { tokens, position: 0, fields }).parse() {
+    match (Parser {
+        tokens,
+        position: 0,
+        fields,
+        lenient_columns: false,
+    })
+    .parse()
+    {
         Ok(value) => value.display(),
         Err(message) => format!("#ERROR: {message}"),
     }
@@ -186,11 +336,17 @@ impl Value {
         match self {
             Value::Number(number) => Ok(*number),
             Value::Bool(value) => Ok(*value as u8 as f64),
-            Value::Text(text) => text
-                .trim()
-                .replace(',', "")
-                .parse()
-                .map_err(|_| format!("\"{text}\" is not a number")),
+            Value::Text(text) => {
+                // Display-formatted values coerce: `$10,346`, `22.74%`.
+                let cleaned: String = text
+                    .trim()
+                    .chars()
+                    .filter(|char| !matches!(char, ',' | '$' | '%'))
+                    .collect();
+                cleaned
+                    .parse()
+                    .map_err(|_| format!("\"{text}\" is not a number"))
+            }
             Value::Date(_) => Err("expected a number, got a date".into()),
         }
     }
@@ -293,11 +449,14 @@ fn tokenize(expression: &str) -> Result<Vec<Token>, String> {
                     tokens.push(Token::Greater);
                 }
             }
-            '"' => {
+            '"' | '\'' => {
+                // Single quotes allow a string to contain double quotes —
+                // needed for criteria arguments like 'COL("Status") = "Active"'.
+                let quote = char;
                 let mut text = String::new();
                 loop {
                     match chars.next() {
-                        Some((_, '"')) => break,
+                        Some((_, char)) if char == quote => break,
                         Some((_, char)) => text.push(char),
                         None => return Err("unclosed string".into()),
                     }
@@ -345,6 +504,7 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     position: usize,
     fields: &'a HashMap<String, String>,
+    lenient_columns: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -567,6 +727,19 @@ impl<'a> Parser<'a> {
                 arity(1)?;
                 Ok(Value::Number(arguments[0].to_number()?.abs()))
             }
+            "DOLLAR" => {
+                if arguments.is_empty() || arguments.len() > 2 {
+                    return Err("DOLLAR takes 1 or 2 arguments".into());
+                }
+                let number = arguments[0].to_number()?;
+                let decimals = arguments
+                    .get(1)
+                    .map(Value::to_number)
+                    .transpose()?
+                    .unwrap_or(0.0)
+                    .max(0.0) as usize;
+                Ok(Value::Text(format_dollar(number, decimals)))
+            }
             "SUM" => Ok(Value::Number(variadic_numbers()?.into_iter().sum())),
             "MIN" => Ok(Value::Number(
                 variadic_numbers()?.into_iter().fold(f64::INFINITY, f64::min),
@@ -614,6 +787,10 @@ impl<'a> Parser<'a> {
                 arity(1)?;
                 Ok(Value::Bool(!arguments[0].to_bool()?))
             }
+            "PHONE" => {
+                arity(1)?;
+                Ok(Value::Text(format_phone(&arguments[0].display())))
+            }
             "UPPER" => {
                 arity(1)?;
                 Ok(Value::Text(arguments[0].display().to_uppercase()))
@@ -625,6 +802,40 @@ impl<'a> Parser<'a> {
             "LEN" => {
                 arity(1)?;
                 Ok(Value::Number(arguments[0].display().chars().count() as f64))
+            }
+            "DSUM" | "DCOUNT" | "DAVERAGE" | "DMEDIAN" | "DMIN" | "DMAX" => {
+                let function = name.to_ascii_uppercase();
+                if arguments.is_empty()
+                    || arguments.len() > 3
+                    || (arguments.len() == 1 && function != "DCOUNT")
+                {
+                    return Err(format!(
+                        "{function} takes a database, a field, and optional criteria \
+                         (DCOUNT may omit the field)"
+                    ));
+                }
+                let database = arguments[0].display();
+                let field = arguments.get(1).map(Value::display);
+                let criteria = arguments.get(2).map(Value::display);
+                self.fields
+                    .get(&database_aggregate_key(
+                        &function,
+                        &database,
+                        field.as_deref(),
+                        criteria.as_deref(),
+                    ))
+                    .cloned()
+                    .map(Value::Text)
+                    .ok_or_else(|| format!("no database named \"{database}\" found"))
+            }
+            "COL" => {
+                arity(1)?;
+                let name = arguments[0].display();
+                match self.fields.get(&col_key(&name)) {
+                    Some(value) => Ok(Value::Text(value.clone())),
+                    None if self.lenient_columns => Ok(Value::Text(String::new())),
+                    None => Err(format!("no column named \"{name}\" in this table")),
+                }
             }
             "FIELD" => match arguments.len() {
                 1 => {
@@ -692,6 +903,35 @@ fn date_difference(start: NaiveDate, end: NaiveDate, unit: &str) -> Result<f64, 
     }
 }
 
+/// Formats a number as dollars with thousands separators: `format_dollar(90000., 0)`
+/// is `$90,000`; negative values render as `-$1,234`.
+pub fn format_dollar(number: f64, decimals: usize) -> String {
+    let negative = number < 0.0;
+    let rounded = format!("{:.*}", decimals, number.abs());
+    let (integer, fraction) = match rounded.split_once('.') {
+        Some((integer, fraction)) => (integer.to_string(), Some(fraction.to_string())),
+        None => (rounded, None),
+    };
+    let mut grouped = String::new();
+    for (count, digit) in integer.chars().rev().enumerate() {
+        if count > 0 && count % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    let mut output = String::new();
+    if negative {
+        output.push('-');
+    }
+    output.push('$');
+    output.extend(grouped.chars().rev());
+    if let Some(fraction) = fraction {
+        output.push('.');
+        output.push_str(&fraction);
+    }
+    output
+}
+
 fn add_or_subtract(left: Value, right: Value, subtract: bool) -> Result<Value, String> {
     match (&left, &right) {
         // Date arithmetic: date ± days, and date - date = days.
@@ -745,6 +985,12 @@ mod tests {
         assert_eq!(evaluate("ROUND(10 / 3, 2)", &fields), "3.33");
         assert_eq!(evaluate("\"a\" & \"b\" & 3", &fields), "ab3");
         assert_eq!(evaluate("SUM(1, 2, 3, 4)", &fields), "10");
+        assert_eq!(evaluate("DOLLAR(90000)", &fields), "$90,000");
+        assert_eq!(evaluate("DOLLAR(1234567.891, 2)", &fields), "$1,234,567.89");
+        assert_eq!(evaluate("DOLLAR(-500)", &fields), "-$500");
+        assert_eq!(evaluate("PHONE(\"4692033705\")", &fields), "(469) 203-3705");
+        assert_eq!(evaluate("PHONE(\"1 (469) 203-3705\")", &fields), "(469) 203-3705");
+        assert_eq!(evaluate("PHONE(\"+51 956 508 400\")", &fields), "+51 956 508 400");
         assert_eq!(evaluate("MAX(3, 9, 4)", &fields), "9");
         assert_eq!(evaluate("LEN(\"hello\")", &fields), "5");
     }
@@ -804,6 +1050,91 @@ mod tests {
             ),
             vec!["Page One".to_string(), "Page Two".to_string()]
         );
+    }
+
+    #[test]
+    fn database_aggregates() {
+        assert_eq!(
+            referenced_database_aggregates(
+                "a `= DOLLAR(DSUM(\"Credit cards\", \"Credit limit\"))` b `= DCOUNT(\"Credit cards\")`"
+            ),
+            vec![
+                (
+                    "DSUM".to_string(),
+                    "Credit cards".to_string(),
+                    Some("Credit limit".to_string()),
+                    None
+                ),
+                (
+                    "DCOUNT".to_string(),
+                    "Credit cards".to_string(),
+                    None,
+                    None
+                ),
+            ]
+        );
+        let mut fields = HashMap::new();
+        fields.insert(
+            database_aggregate_key("DSUM", "Credit cards", Some("Credit limit"), None),
+            "77000".to_string(),
+        );
+        fields.insert(
+            database_aggregate_key(
+                "DCOUNT",
+                "Credit cards",
+                Some(""),
+                Some("COL(\"Status\") = \"Active\""),
+            ),
+            "10".to_string(),
+        );
+        assert_eq!(
+            evaluate("DOLLAR(DSUM(\"Credit cards\", \"Credit limit\"))", &fields),
+            "$77,000"
+        );
+        assert!(evaluate("DSUM(\"Nope\", \"x\")", &fields).starts_with("#ERROR"));
+        assert_eq!(
+            evaluate(
+                "DCOUNT(\"Credit cards\", \"\", 'COL(\"Status\") = \"Active\"')",
+                &fields
+            ),
+            "10"
+        );
+        assert_eq!(
+            referenced_database_aggregates(
+                "`= DCOUNT(\"Cards\", \"\", 'COL(\"Status\") = \"Active\"')`"
+            ),
+            vec![(
+                "DCOUNT".to_string(),
+                "Cards".to_string(),
+                Some("".to_string()),
+                Some("COL(\"Status\") = \"Active\"".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn where_conditions() {
+        let mut fields = HashMap::new();
+        fields.insert(col_key("Status"), "Paid off".to_string());
+        fields.insert(col_key("APR"), "22.74%".to_string());
+        fields.insert(col_key("Balance"), "$1,200".to_string());
+        assert_eq!(
+            evaluate_condition("COL(\"Status\") <> \"Closed\"", &fields),
+            Ok(true)
+        );
+        assert_eq!(
+            evaluate_condition("COL(\"Status\") = \"paid off\"", &fields),
+            Ok(true)
+        );
+        assert_eq!(evaluate_condition("COL(\"APR\") < 25", &fields), Ok(true));
+        assert_eq!(
+            evaluate_condition(
+                "AND(COL(\"Balance\") > 1000, COL(\"Status\") <> \"Active\")",
+                &fields
+            ),
+            Ok(true)
+        );
+        assert!(evaluate_condition("COL(\"Nope\") = 1", &fields).is_err());
     }
 
     #[test]
