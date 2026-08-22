@@ -726,7 +726,13 @@ impl MacWindow {
             let () = msg_send![
                 native_window,
                 registerForDraggedTypes:
-                    NSArray::arrayWithObject(nil, NSFilenamesPboardType)
+                    NSArray::arrayWithObjects(
+                        nil,
+                        &[
+                            NSFilenamesPboardType,
+                            ns_string(FILE_PROMISE_PASTEBOARD_TYPE),
+                        ],
+                    )
             ];
             let () = msg_send![
                 native_window,
@@ -2586,7 +2592,12 @@ fn screen_point_to_gpui_point(this: &Object, position: NSPoint) -> Point<Pixels>
 extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
-    let paths = external_paths_from_event(dragging_info);
+    // A drag can carry file promises instead of real paths (an unsaved
+    // screenshot thumbnail). Promised files can only be materialized during
+    // performDragOperation, so accept the drag with an empty path list and
+    // swap the real paths in at drop time.
+    let paths = external_paths_from_event(dragging_info)
+        .or_else(|| has_file_promise(dragging_info).then(|| ExternalPaths(SmallVec::new())));
     if let Some(event) = paths.map(|paths| FileDropEvent::Entered { position, paths })
         && send_file_drop_event(window_state, event)
     {
@@ -2613,6 +2624,18 @@ extern "C" fn dragging_exited(this: &Object, _: Sel, _: id) {
 extern "C" fn perform_drag_operation(this: &Object, _: Sel, dragging_info: id) -> BOOL {
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
+    if external_paths_from_event(dragging_info).is_none()
+        && let Some(paths) = promised_paths_from_event(dragging_info)
+    {
+        // The drag entered with an empty path list (see dragging_entered);
+        // replace the placeholder drag with the materialized paths before
+        // submitting.
+        send_file_drop_event(window_state.clone(), FileDropEvent::Exited);
+        send_file_drop_event(
+            window_state.clone(),
+            FileDropEvent::Entered { position, paths },
+        );
+    }
     send_file_drop_event(window_state, FileDropEvent::Submit { position }).to_objc()
 }
 
@@ -2629,6 +2652,67 @@ fn external_paths_from_event(dragging_info: *mut Object) -> Option<ExternalPaths
             CStr::from_ptr(f).to_string_lossy().into_owned()
         };
         paths.push(PathBuf::from(path))
+    }
+    Some(ExternalPaths(paths))
+}
+
+/// The UTI for promised files on the drag pasteboard
+/// (`kPasteboardTypeFileURLPromise`): the file does not exist yet; the drag
+/// source writes it only once a receiver names a destination directory.
+const FILE_PROMISE_PASTEBOARD_TYPE: &str = "com.apple.pasteboard.promised-file-url";
+
+fn has_file_promise(dragging_info: *mut Object) -> bool {
+    unsafe {
+        let pasteboard: id = msg_send![dragging_info, draggingPasteboard];
+        let types = NSArray::arrayWithObject(nil, ns_string(FILE_PROMISE_PASTEBOARD_TYPE));
+        let available: id = msg_send![pasteboard, availableTypeFromArray: types];
+        available != nil
+    }
+}
+
+/// Asks the drag source to write its promised files into a fresh temp
+/// directory and returns the paths they will occupy. The source may still be
+/// writing when this returns; receivers get valid paths either way.
+fn promised_paths_from_event(dragging_info: *mut Object) -> Option<ExternalPaths> {
+    if !has_file_promise(dragging_info) {
+        return None;
+    }
+    let destination = std::env::temp_dir().join(format!(
+        "zed-promised-drop-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&destination).ok()?;
+    let mut paths = SmallVec::new();
+    unsafe {
+        let destination_string = ns_string(destination.to_str()?);
+        let url: id =
+            msg_send![class!(NSURL), fileURLWithPath: destination_string isDirectory: YES];
+        let names: id = msg_send![dragging_info, namesOfPromisedFilesDroppedAtDestination: url];
+        if names == nil {
+            return None;
+        }
+        for name in names.iter() {
+            let name = CStr::from_ptr(NSString::UTF8String(name))
+                .to_string_lossy()
+                .into_owned();
+            paths.push(destination.join(name));
+        }
+    }
+    if paths.is_empty() {
+        return None;
+    }
+    // The drag source writes the files only after we named the destination,
+    // and receivers like the agent panel stat the path on drop. Give the
+    // source a moment to finish; fall through with the paths regardless so
+    // slow writers still deliver text-only receivers a valid path.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while paths.iter().any(|path: &PathBuf| !path.exists()) && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     Some(ExternalPaths(paths))
 }
