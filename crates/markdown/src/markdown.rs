@@ -1048,32 +1048,150 @@ pub struct MarkdownElement {
     /// span), returns its display value; the span renders as that value
     /// instead of a code chip.
     formula_resolver: Option<Box<dyn Fn(&str) -> String>>,
+    /// Given a table `where:` expression and a row's (header, value) cells,
+    /// returns whether the row renders. `Err` fails open (the row renders).
+    table_row_filter: Option<Box<dyn Fn(&str, &[(String, String)]) -> Result<bool, String>>>,
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
 }
 
-/// Reorders each sorted table's body-row event spans according to its
-/// [`TableSort`]. Events keep their original source ranges, so selection,
-/// copy, and click-to-source keep working on the sorted view.
-fn apply_table_sorts(
+/// Table directives from HTML comments preceding a table, keyed by the
+/// table's source start: `<!-- where: EXPRESSION -->` filters rows, and
+/// `<!-- table-footer: N -->` pins the last N rows as a footer excluded from
+/// sorting and filtering.
+#[derive(Default)]
+struct TableDirectives {
+    wheres: HashMap<usize, String>,
+    footers: HashMap<usize, usize>,
+}
+
+fn collect_table_directives(
+    events: &[(Range<usize>, MarkdownEvent)],
+    source: &str,
+) -> TableDirectives {
+    let mut directives = TableDirectives::default();
+    let mut pending_where: Option<String> = None;
+    let mut pending_footer: Option<usize> = None;
+    let comment_body = |range: &Range<usize>| -> Option<String> {
+        let text = source.get(range.clone()).unwrap_or_default().trim();
+        Some(text.strip_prefix("<!--")?.strip_suffix("-->")?.trim().to_string())
+    };
+    for (range, event) in events {
+        match event {
+            // With `parse_html` enabled the comment's Html text event is
+            // consumed, so read the directive from the block's source range.
+            MarkdownEvent::Start(MarkdownTag::HtmlBlock)
+            | MarkdownEvent::Html
+            | MarkdownEvent::InlineHtml => {
+                if let Some(body) = comment_body(range) {
+                    if let Some(expression) = body.strip_prefix("where:") {
+                        pending_where = Some(expression.trim().to_string());
+                    } else if let Some(count) = body.strip_prefix("table-footer:") {
+                        pending_footer = count.trim().parse().ok();
+                    }
+                }
+            }
+            MarkdownEvent::Start(MarkdownTag::Table(_)) => {
+                if let Some(expression) = pending_where.take() {
+                    directives.wheres.insert(range.start, expression);
+                }
+                if let Some(count) = pending_footer.take() {
+                    directives.footers.insert(range.start, count);
+                }
+            }
+            // Any other block between the directive and a table orphans it.
+            MarkdownEvent::Start(
+                MarkdownTag::Paragraph
+                | MarkdownTag::Heading { .. }
+                | MarkdownTag::List(_)
+                | MarkdownTag::CodeBlock { .. }
+                | MarkdownTag::BlockQuote,
+            ) => {
+                pending_where = None;
+                pending_footer = None;
+            }
+            _ => {}
+        }
+    }
+    directives
+}
+
+/// All cell texts of one table row (or head) span, in column order, with
+/// formula cells contributing their computed value — the same thing the user
+/// sees — rather than the formula source.
+fn table_row_cells(
+    events: &[(Range<usize>, MarkdownEvent)],
+    span: (usize, usize),
+    source: &str,
+    formula_resolver: Option<&dyn Fn(&str) -> String>,
+) -> Vec<String> {
+    let (start, end) = span;
+    let mut cells = Vec::new();
+    let mut current: Option<String> = None;
+    for position in start..=end {
+        match &events[position].1 {
+            MarkdownEvent::Start(MarkdownTag::TableCell) => current = Some(String::new()),
+            MarkdownEvent::End(MarkdownTagEnd::TableCell) => {
+                if let Some(text) = current.take() {
+                    cells.push(text.trim().to_string());
+                }
+            }
+            MarkdownEvent::Text => {
+                if let Some(text) = current.as_mut() {
+                    text.push_str(&source[events[position].0.clone()]);
+                }
+            }
+            MarkdownEvent::Code => {
+                if let Some(text) = current.as_mut() {
+                    let content = &source[events[position].0.clone()];
+                    if let Some(resolver) = formula_resolver
+                        && let Some(expression) = content.strip_prefix("= ")
+                    {
+                        text.push_str(&resolver(expression));
+                    } else {
+                        text.push_str(content);
+                    }
+                }
+            }
+            MarkdownEvent::SubstitutedText(substituted) => {
+                if let Some(text) = current.as_mut() {
+                    text.push_str(substituted);
+                }
+            }
+            _ => {}
+        }
+    }
+    cells
+}
+
+/// Filters and reorders each table's body-row event spans according to its
+/// `where:` directive and [`TableSort`]. Events keep their original source
+/// ranges, so selection, copy, and click-to-source keep working on the
+/// transformed view.
+fn apply_table_transforms(
     events: &[(Range<usize>, MarkdownEvent)],
     source: &str,
     sorts: &BTreeMap<usize, TableSort>,
+    directives: &TableDirectives,
     formula_resolver: Option<&dyn Fn(&str) -> String>,
+    table_row_filter: Option<&dyn Fn(&str, &[(String, String)]) -> Result<bool, String>>,
 ) -> Vec<(Range<usize>, MarkdownEvent)> {
     let mut output = Vec::with_capacity(events.len());
     let mut index = 0;
     while index < events.len() {
         let (range, event) = &events[index];
-        let sort = match event {
-            MarkdownEvent::Start(MarkdownTag::Table(_)) => sorts.get(&range.start).copied(),
-            _ => None,
+        let (sort, where_expression) = match event {
+            MarkdownEvent::Start(MarkdownTag::Table(_)) => (
+                sorts.get(&range.start).copied(),
+                directives.wheres.get(&range.start).cloned(),
+            ),
+            _ => (None, None),
         };
-        let Some(sort) = sort else {
+        if sort.is_none() && where_expression.is_none() {
             output.push(events[index].clone());
             index += 1;
             continue;
-        };
+        }
 
         let mut end = index;
         for (offset, (_, event)) in events[index..].iter().enumerate() {
@@ -1087,8 +1205,16 @@ fn apply_table_sorts(
         // TableRow events.
         let mut rows: Vec<(usize, usize)> = Vec::new();
         let mut row_start = None;
+        let mut head_span: Option<(usize, usize)> = None;
+        let mut head_start = None;
         for position in index..=end {
             match &events[position].1 {
+                MarkdownEvent::Start(MarkdownTag::TableHead) => head_start = Some(position),
+                MarkdownEvent::End(MarkdownTagEnd::TableHead) => {
+                    if let Some(start) = head_start.take() {
+                        head_span = Some((start, position));
+                    }
+                }
                 MarkdownEvent::Start(MarkdownTag::TableRow) => row_start = Some(position),
                 MarkdownEvent::End(MarkdownTagEnd::TableRow) => {
                     if let Some(start) = row_start.take() {
@@ -1104,87 +1230,106 @@ fn apply_table_sorts(
             continue;
         }
 
-        let mut keyed: Vec<(String, (usize, usize))> = rows
-            .iter()
-            .map(|&(start, end)| {
-                let mut column = 0usize;
-                let mut in_target = false;
-                let mut text = String::new();
-                for position in start..=end {
-                    match &events[position].1 {
-                        MarkdownEvent::Start(MarkdownTag::TableCell) => {
-                            in_target = column == sort.column;
-                        }
-                        MarkdownEvent::End(MarkdownTagEnd::TableCell) => {
-                            column += 1;
-                            in_target = false;
-                        }
-                        MarkdownEvent::Text if in_target => {
-                            text.push_str(&source[events[position].0.clone()]);
-                        }
-                        MarkdownEvent::Code if in_target => {
-                            let content = &source[events[position].0.clone()];
-                            // Sort formula cells by their computed value —
-                            // the same thing the user sees — not the formula.
-                            if let Some(resolver) = formula_resolver
-                                && let Some(expression) = content.strip_prefix("= ")
-                            {
-                                text.push_str(&resolver(expression));
-                            } else {
-                                text.push_str(content);
-                            }
-                        }
-                        MarkdownEvent::SubstitutedText(substituted) if in_target => {
-                            text.push_str(substituted);
-                        }
-                        _ => {}
+        let first_row = rows[0].0;
+        let last_row_end = rows[rows.len() - 1].1;
+        // Footer rows (a view's aggregates) are pinned: excluded from
+        // filtering and sorting, always emitted last.
+        let footer_count = directives
+            .footers
+            .get(&range.start)
+            .copied()
+            .unwrap_or(0)
+            .min(rows.len());
+        let footer_spans = rows.split_off(rows.len() - footer_count);
+
+        let mut visible = rows.clone();
+        if let (Some(expression), Some(filter), Some(head_span)) =
+            (&where_expression, table_row_filter, head_span)
+        {
+            let headers = table_row_cells(events, head_span, source, formula_resolver);
+            visible.retain(|&span| {
+                let mut cells = table_row_cells(events, span, source, formula_resolver);
+                cells.resize(headers.len(), String::new());
+                let pairs: Vec<(String, String)> =
+                    headers.iter().cloned().zip(cells).collect();
+                match filter(expression, &pairs) {
+                    Ok(keep) => keep,
+                    // Fail open: a broken condition shows every row rather
+                    // than silently hiding data.
+                    Err(error) => {
+                        log::debug!("table where clause: {error}");
+                        true
                     }
                 }
-                (text.trim().to_string(), (start, end))
+            });
+        }
+
+        let Some(sort) = sort else {
+            output.extend_from_slice(&events[index..first_row]);
+            for &(start, end) in visible.iter().chain(&footer_spans) {
+                output.extend_from_slice(&events[start..=end]);
+            }
+            output.extend_from_slice(&events[last_row_end + 1..=end]);
+            index = end + 1;
+            continue;
+        };
+
+        let mut keyed: Vec<(String, (usize, usize))> = visible
+            .iter()
+            .map(|&span| {
+                let cells = table_row_cells(events, span, source, formula_resolver);
+                let key = cells.get(sort.column).cloned().unwrap_or_default();
+                (key, span)
             })
             .collect();
         keyed.sort_by(|(left, _), (right, _)| {
-            let left_number = table_sort_date(left).or_else(|| table_sort_number(left));
-            let right_number = table_sort_date(right).or_else(|| table_sort_number(right));
-            // Rank groups don't reverse with the direction: numbers stay above
-            // text, and blank/error cells stay at the bottom (as in
-            // spreadsheets) whether sorting ascending or descending.
-            let rank = |key: &str, number: &Option<f64>| -> u8 {
-                if key.is_empty() || key.starts_with("#ERROR") {
-                    2
-                } else if number.is_some() {
-                    0
-                } else {
-                    1
-                }
-            };
-            rank(left, &left_number)
-                .cmp(&rank(right, &right_number))
-                .then_with(|| {
-                    let ordering = match (left_number, right_number) {
-                        (Some(left), Some(right)) => {
-                            left.partial_cmp(&right).unwrap_or(std::cmp::Ordering::Equal)
-                        }
-                        _ => left.to_lowercase().cmp(&right.to_lowercase()),
-                    };
-                    if sort.descending {
-                        ordering.reverse()
-                    } else {
-                        ordering
-                    }
-                })
+            compare_table_cell_text(left, right, sort.descending)
         });
 
-        let first_row = rows[0].0;
-        let last_row_end = rows[rows.len() - 1].1;
         output.extend_from_slice(&events[index..first_row]);
         for &(_, (start, end)) in &keyed {
+            output.extend_from_slice(&events[start..=end]);
+        }
+        for &(start, end) in &footer_spans {
             output.extend_from_slice(&events[start..=end]);
         }
         output.extend_from_slice(&events[last_row_end + 1..=end]);
         index = end + 1;
     }
     output
+}
+
+/// Orders two table cell texts the way the preview sorts columns: dates
+/// chronologically, then numbers numerically, then text case-insensitively,
+/// with blank/#ERROR cells always last regardless of direction (rank groups
+/// don't reverse, as in spreadsheets).
+pub fn compare_table_cell_text(left: &str, right: &str, descending: bool) -> std::cmp::Ordering {
+    let left_number = table_sort_date(left)
+        .or_else(|| table_sort_tenure(left))
+        .or_else(|| table_sort_number(left));
+    let right_number = table_sort_date(right)
+        .or_else(|| table_sort_tenure(right))
+        .or_else(|| table_sort_number(right));
+    let rank = |key: &str, number: &Option<f64>| -> u8 {
+        if key.is_empty() || key.starts_with("#ERROR") {
+            2
+        } else if number.is_some() {
+            0
+        } else {
+            1
+        }
+    };
+    rank(left, &left_number)
+        .cmp(&rank(right, &right_number))
+        .then_with(|| {
+            let ordering = match (left_number, right_number) {
+                (Some(left), Some(right)) => {
+                    left.partial_cmp(&right).unwrap_or(std::cmp::Ordering::Equal)
+                }
+                _ => left.to_lowercase().cmp(&right.to_lowercase()),
+            };
+            if descending { ordering.reverse() } else { ordering }
+        })
 }
 
 /// Sort key for a date-shaped cell: `MM/DD/YYYY`, `M/D/YY`, and `YYYY-MM-DD`
@@ -1219,6 +1364,29 @@ fn table_sort_date(text: &str) -> Option<f64> {
         return None;
     }
     Some((year * 10000 + month * 100 + day) as f64)
+}
+
+/// Sort key for tenure-shaped cells — "6 years, 3 months", "1 year",
+/// "8 months" — as a total month count, so ages within the same year order
+/// by month instead of by the leading number alone. The whole cell must be
+/// tenure-shaped; trailing prose ("3 months severance") opts out.
+fn table_sort_tenure(text: &str) -> Option<f64> {
+    let mut years = None;
+    let mut months = None;
+    let mut tokens = text.split_whitespace();
+    while let Some(token) = tokens.next() {
+        let number: f64 = token.parse().ok()?;
+        let unit = tokens.next()?.trim_end_matches(',');
+        match unit {
+            "year" | "years" if years.is_none() => years = Some(number),
+            "month" | "months" if months.is_none() => months = Some(number),
+            _ => return None,
+        }
+    }
+    if years.is_none() && months.is_none() {
+        return None;
+    }
+    Some(years.unwrap_or(0.0) * 12.0 + months.unwrap_or(0.0))
 }
 
 /// Numeric sort key for a cell, tolerating `$`, `,`, `%` and surrounding text
@@ -1276,6 +1444,7 @@ impl MarkdownElement {
             link_icon_resolver: None,
             emoji_icon_resolver: None,
             formula_resolver: None,
+            table_row_filter: None,
             show_root_block_markers: false,
             autoscroll: AutoscrollBehavior::Propagate,
         }
@@ -1366,6 +1535,14 @@ impl MarkdownElement {
 
     pub fn formula_resolver(mut self, resolver: impl Fn(&str) -> String + 'static) -> Self {
         self.formula_resolver = Some(Box::new(resolver));
+        self
+    }
+
+    pub fn table_row_filter(
+        mut self,
+        filter: impl Fn(&str, &[(String, String)]) -> Result<bool, String> + 'static,
+    ) -> Self {
+        self.table_row_filter = Some(Box::new(filter));
         self
     }
 
@@ -2150,15 +2327,20 @@ impl Element for MarkdownElement {
                 markdown.mermaid_state.clone(),
             )
         };
-        // With any active table sort, render a permuted copy of the events —
-        // the source itself is untouched.
+        // With any active table sort or `where:` directive, render a
+        // filtered/permuted copy of the events — the source itself is
+        // untouched.
         let table_sorts = self.markdown.read(cx).table_sorts.clone();
-        let sorted_events = (!table_sorts.is_empty()).then(|| {
-            apply_table_sorts(
+        let directives =
+            collect_table_directives(&parsed_markdown.events, parsed_markdown.source());
+        let sorted_events = (!table_sorts.is_empty() || !directives.wheres.is_empty()).then(|| {
+            apply_table_transforms(
                 &parsed_markdown.events,
                 parsed_markdown.source(),
                 &table_sorts,
+                &directives,
                 self.formula_resolver.as_deref(),
+                self.table_row_filter.as_deref(),
             )
         });
         let events: &[(Range<usize>, MarkdownEvent)] =
@@ -2710,6 +2892,25 @@ impl Element for MarkdownElement {
                         MarkdownTag::Table(alignments) => {
                             builder.table.start(alignments.clone());
                             builder.table.source_start = range.start;
+                            builder.table.footer_start_row =
+                                directives.footers.get(&range.start).and_then(|footer| {
+                                    let total = events[index..]
+                                        .iter()
+                                        .take_while(|(_, event)| {
+                                            !matches!(
+                                                event,
+                                                MarkdownEvent::End(MarkdownTagEnd::Table)
+                                            )
+                                        })
+                                        .filter(|(_, event)| {
+                                            matches!(
+                                                event,
+                                                MarkdownEvent::Start(MarkdownTag::TableRow)
+                                            )
+                                        })
+                                        .count();
+                                    total.checked_sub(*footer)
+                                });
 
                             let column_count = alignments.len() as u16;
                             let table = div()
@@ -2820,7 +3021,26 @@ impl Element for MarkdownElement {
                                     _ => {}
                                 }
                             }
+                            // Footer cells (view aggregates) render smaller and
+                            // muted, like Notion's calculation row. The size
+                            // must be element-level: text runs carry no size.
+                            let is_footer_cell = !is_header
+                                && builder
+                                    .table
+                                    .footer_start_row
+                                    .is_some_and(|start| row_index >= start);
+                            let footer_font_size = match builder.text_style().font_size {
+                                gpui::AbsoluteLength::Pixels(pixels) => {
+                                    gpui::AbsoluteLength::Pixels(pixels * 0.85)
+                                }
+                                gpui::AbsoluteLength::Rems(rems) => {
+                                    gpui::AbsoluteLength::Rems(rems * 0.85)
+                                }
+                            };
                             let cell = div()
+                                    .when(is_footer_cell, |this| {
+                                        this.text_size(footer_font_size)
+                                    })
                                     .when(col_index > 0, |this| this.border_l_1())
                                     .when(row_index > 0, |this| this.border_t_1())
                                     .border_color(cx.theme().colors().border)
@@ -2874,6 +3094,17 @@ impl Element for MarkdownElement {
                                 cell.into()
                             };
                             builder.push_div(cell, range, markdown_end);
+                            if is_footer_cell {
+                                builder.push_text_style(TextStyleRefinement {
+                                    // The size lives on the cell div; runs only
+                                    // need the muted color (and to shape at the
+                                    // cell's size).
+                                    font_size: Some(footer_font_size),
+                                    color: Some(cx.theme().colors().text_muted),
+                                    ..Default::default()
+                                });
+                            }
+                            builder.in_footer_cell = is_footer_cell;
                             builder.wrap_words = cell_wraps;
                             if cell_wraps && cell_has_line_break {
                                 builder.in_multiline_cell = true;
@@ -2996,6 +3227,10 @@ impl Element for MarkdownElement {
                     }
                     MarkdownTagEnd::TableCell => {
                         builder.replace_pending_checkbox(range);
+                        if builder.in_footer_cell {
+                            builder.in_footer_cell = false;
+                            builder.pop_text_style();
+                        }
                         // Chevron on the actively sorted header column.
                         if builder.table.in_head
                             && let Some(sort) =
@@ -3388,6 +3623,9 @@ struct TableState {
     col_index: usize,
     /// The table's source start offset — its identity for sort state.
     source_start: usize,
+    /// First body-row index of the pinned footer (`table-footer` directive),
+    /// so footer cells can render smaller and muted, Notion-style.
+    footer_start_row: Option<usize>,
 }
 
 impl TableState {
@@ -3463,6 +3701,9 @@ struct MarkdownElementBuilder {
     /// Swallow leading spaces from the next text run (set after a `<br>`, whose
     /// padding space would otherwise indent the new line).
     trim_leading_space: bool,
+    /// Inside a pinned footer cell, whose pushed text style must pop at the
+    /// cell's end.
+    in_footer_cell: bool,
     /// When set (inside a footnote/source definition), paragraphs use tight
     /// spacing so the sources list isn't stretched out by body paragraph margins.
     in_footnote: bool,
@@ -3514,6 +3755,7 @@ impl MarkdownElementBuilder {
             open_diff_row: None,
             in_multiline_cell: false,
             trim_leading_space: false,
+            in_footer_cell: false,
             in_footnote: false,
             open_centers: 0,
             html_comment: false,
@@ -4219,6 +4461,29 @@ fn parse_image_size(text: &str) -> (Option<DefiniteLength>, Option<DefiniteLengt
 mod tests {
     use super::*;
     use gpui::{TestAppContext, size};
+
+    #[test]
+    fn test_collect_table_wheres() {
+        let source = "<!-- where: COL(\"Status\") = \"Active\" -->\n| Status |\n|---|\n| Active |\n| Closed |\n";
+        // The preview parses with `parse_html: true`; cover both modes.
+        for parse_html in [false, true] {
+            let parsed = parser::parse_markdown_with_options(source, parse_html, false);
+            let directives = collect_table_directives(&parsed.events, source);
+            assert_eq!(
+                directives.wheres.values().collect::<Vec<_>>(),
+                vec![&"COL(\"Status\") = \"Active\"".to_string()],
+                "parse_html={parse_html}, events: {:#?}",
+                parsed.events
+            );
+        }
+
+        let footer_source = "<!-- table-footer: 1 -->\n| A |\n|---|\n| 1 |\n| **SUM** 1 |\n";
+        for parse_html in [false, true] {
+            let parsed = parser::parse_markdown_with_options(footer_source, parse_html, false);
+            let directives = collect_table_directives(&parsed.events, footer_source);
+            assert_eq!(directives.footers.values().collect::<Vec<_>>(), vec![&1]);
+        }
+    }
     use language::{Language, LanguageConfig, LanguageMatcher};
     use std::sync::Arc;
 
