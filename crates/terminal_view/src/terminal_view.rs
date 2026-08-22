@@ -844,7 +844,14 @@ impl TerminalView {
     }
 
     fn add_paths_to_terminal(&self, paths: &[PathBuf], window: &mut Window, cx: &mut App) {
-        let mut text = paths.iter().map(|path| format!(" {path:?}")).join("");
+        // Shell-quote rather than Debug-format: Debug escapes non-ASCII
+        // (macOS screenshot names contain U+202F) into literal `\u{...}`,
+        // corrupting the path for anything that resolves it.
+        let mut text = String::new();
+        for path in paths {
+            text.push(' ');
+            text.push_str(&shell_escape_path(&path.to_string_lossy()));
+        }
         text.push(' ');
         window.focus(&self.focus_handle(cx), cx);
         self.terminal.update(cx, |terminal, _| {
@@ -1111,6 +1118,18 @@ fn subscribe_for_terminal_events(
         },
     );
     vec![terminal_subscription, terminal_events_subscription]
+}
+
+fn shell_escape_path(path: &str) -> String {
+    let is_safe_char = |char: char| {
+        char.is_ascii_alphanumeric()
+            || matches!(char, '/' | '.' | '_' | '-' | '+' | ':' | '@' | '%' | ',' | '=')
+    };
+    if !path.is_empty() && path.chars().all(is_safe_char) {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
 }
 
 fn regex_search_for_query(query: &SearchQuery) -> Option<RegexSearch> {
