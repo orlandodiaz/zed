@@ -7121,6 +7121,78 @@ impl Render for ProjectPanel {
                 .child(
                     v_flex()
                         .child(
+                            h_flex()
+                                .flex_none()
+                                .h(ui::Tab::container_height(cx))
+                                .px_2()
+                                .justify_between()
+                                .border_b_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .child(
+                                    Label::new("Project")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            IconButton::new(
+                                                "project-panel-expand-selected",
+                                                IconName::ExpandVertical,
+                                            )
+                                            .icon_size(IconSize::XSmall)
+                                            .tooltip(Tooltip::for_action_title(
+                                                "Expand Selected",
+                                                &ExpandSelectedEntry,
+                                            ))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.expand_selected_entry(
+                                                    &ExpandSelectedEntry,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                        )
+                                        .child(
+                                            IconButton::new(
+                                                "project-panel-collapse-selected",
+                                                IconName::ChevronUpDown,
+                                            )
+                                            .icon_size(IconSize::XSmall)
+                                            .tooltip(Tooltip::for_action_title(
+                                                "Collapse Selected & Children",
+                                                &CollapseSelectedEntryAndChildren,
+                                            ))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.collapse_selected_entry_and_children(
+                                                    &CollapseSelectedEntryAndChildren,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                        )
+                                        .child(
+                                            IconButton::new(
+                                                "project-panel-collapse-all",
+                                                IconName::ListCollapse,
+                                            )
+                                            .icon_size(IconSize::XSmall)
+                                            .tooltip(Tooltip::for_action_title(
+                                                "Collapse All",
+                                                &CollapseAllEntries,
+                                            ))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.collapse_all_entries(
+                                                    &CollapseAllEntries,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                        ),
+                                ),
+                        )
+                        .child(
                             uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {
                                     this.rendered_entries_len = range.end - range.start;
