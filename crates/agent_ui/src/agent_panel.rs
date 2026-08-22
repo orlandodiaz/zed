@@ -3504,18 +3504,19 @@ impl AgentPanel {
 
     fn render_drag_target(&self, cx: &Context<Self>) -> Div {
         let is_local = self.project.read(cx).is_local();
+        let drop_target_background = cx.theme().colors().drop_target_background;
         div()
-            .invisible()
             .absolute()
             .top_0()
             .right_0()
             .bottom_0()
             .left_0()
-            .bg(cx.theme().colors().drop_target_background)
-            .drag_over::<DraggedTab>(|this, _, _, _| this.visible())
-            .drag_over::<DraggedSelection>(|this, _, _, _| this.visible())
+            .drag_over::<DraggedTab>(move |this, _, _, _| this.bg(drop_target_background))
+            .drag_over::<DraggedSelection>(move |this, _, _, _| this.bg(drop_target_background))
             .when(is_local, |this| {
-                this.drag_over::<ExternalPaths>(|this, _, _, _| this.visible())
+                this.drag_over::<ExternalPaths>(move |this, _, _, _| {
+                    this.bg(drop_target_background)
+                })
             })
             .on_drop(cx.listener(move |this, tab: &DraggedTab, window, cx| {
                 let item = tab.pane.read(cx).item_for_index(tab.ix);
@@ -3535,30 +3536,37 @@ impl AgentPanel {
                 }),
             )
             .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
-                let tasks = paths
-                    .paths()
-                    .iter()
-                    .map(|path| {
-                        Workspace::project_path_for_path(this.project.clone(), path, false, cx)
-                    })
-                    .collect::<Vec<_>>();
-                cx.spawn_in(window, async move |this, cx| {
-                    let mut paths = vec![];
-                    let mut added_worktrees = vec![];
-                    let opened_paths = futures::future::join_all(tasks).await;
-                    for entry in opened_paths {
-                        if let Some((worktree, project_path)) = entry.log_err() {
-                            added_worktrees.push(worktree);
-                            paths.push(project_path);
-                        }
-                    }
-                    this.update_in(cx, |this, window, cx| {
-                        this.handle_drop(paths, added_worktrees, window, cx);
-                    })
-                    .ok();
-                })
-                .detach();
+                this.handle_external_paths_drop(paths, window, cx);
             }))
+    }
+
+    fn handle_external_paths_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tasks = paths
+            .paths()
+            .iter()
+            .map(|path| Workspace::project_path_for_path(self.project.clone(), path, false, cx))
+            .collect::<Vec<_>>();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut paths = vec![];
+            let mut added_worktrees = vec![];
+            let opened_paths = futures::future::join_all(tasks).await;
+            for entry in opened_paths {
+                if let Some((worktree, project_path)) = entry.log_err() {
+                    added_worktrees.push(worktree);
+                    paths.push(project_path);
+                }
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.handle_drop(paths, added_worktrees, window, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn handle_drop(
