@@ -604,59 +604,136 @@ impl MarkdownPreviewView {
                 } else {
                     strip_footnotes(&contents)
                 };
-                let formula_fields = crate::formulas::build_field_index(&contents);
-                let frontmatter = crate::formulas::frontmatter_pairs(&contents);
-                // Cross-page `FIELD("page", "field")` references: resolve each
-                // referenced page to a file now (worktrees are only iterated
-                // when such references exist); their contents load below,
-                // outside this update closure, so evaluation itself never
-                // touches the filesystem.
+                // ```view blocks and cross-page FIELD() references both need
+                // the worktrees and filesystem; capture cheap snapshots here
+                // so the loading below runs outside any entity update.
+                let view_blocks = crate::views::parse_view_blocks(&contents);
                 let referenced = crate::formulas::referenced_pages(&contents);
-                let mut cross_pages: Vec<(String, std::path::PathBuf)> = Vec::new();
+                let database_aggregates =
+                    crate::formulas::referenced_database_aggregates(&contents);
+                let mut snapshots = Vec::new();
                 let mut fs = None;
-                if !referenced.is_empty()
+                if (!view_blocks.is_empty()
+                    || !referenced.is_empty()
+                    || !database_aggregates.is_empty())
                     && let Some(workspace) = view.workspace.upgrade()
                 {
                     let project = workspace.read(cx).project().read(cx);
                     fs = Some(project.fs().clone());
-                    for page in referenced {
-                        let file_name = format!("{page}.md");
-                        let path = project.worktrees(cx).find_map(|worktree| {
-                            let worktree = worktree.read(cx);
-                            // include_ignored: wiki notes are often gitignored.
-                            worktree.files(true, 0).find_map(|entry| {
-                                let name = entry.path.file_name()?;
-                                name.eq_ignore_ascii_case(&file_name)
-                                    .then(|| worktree.absolutize(&entry.path))
-                            })
-                        });
-                        if let Some(path) = path {
-                            cross_pages.push((page, path));
-                        }
-                    }
+                    snapshots = project
+                        .worktrees(cx)
+                        .map(|worktree| worktree.read(cx).snapshot())
+                        .collect::<Vec<_>>();
                 }
+                let own_path = view.current_path.clone();
                 Some((
-                    SharedString::from(contents),
+                    contents,
                     selection_start,
-                    formula_fields,
-                    frontmatter,
-                    cross_pages,
+                    view_blocks,
+                    referenced,
+                    snapshots,
                     fs,
+                    own_path,
                 ))
             })?;
 
             let update = match update {
                 Some((
-                    contents,
+                    mut contents,
                     selection_start,
-                    mut formula_fields,
-                    frontmatter,
-                    cross_pages,
+                    view_blocks,
+                    referenced,
+                    snapshots,
                     fs,
+                    own_path,
                 )) => {
-                    if let Some(fs) = fs {
-                        for (page, path) in cross_pages {
-                            if let Ok(source) = fs.load(&path).await {
+                    // Expand ```view blocks into markdown tables, replacing
+                    // back-to-front so earlier ranges stay valid.
+                    if let Some(fs) = fs.as_ref() {
+                        for block in view_blocks.iter().rev() {
+                            let table =
+                                expand_view_block(block, &snapshots, fs, own_path.as_ref()).await;
+                            contents.replace_range(block.range.clone(), &table);
+                        }
+                    }
+
+                    let mut formula_fields = crate::formulas::build_field_index(&contents);
+                    let frontmatter = crate::formulas::frontmatter_pairs(&contents);
+
+                    // Precompute database aggregates (DSUM etc.) so formula
+                    // evaluation stays synchronous and filesystem-free.
+                    if let Some(fs) = fs.as_ref() {
+                        let aggregates =
+                            crate::formulas::referenced_database_aggregates(&contents);
+                        let mut databases: HashMap<String, Vec<crate::views::ViewRecord>> =
+                            HashMap::new();
+                        for (function, database, field, criteria) in aggregates {
+                            let key = database.to_ascii_lowercase();
+                            if !databases.contains_key(&key) {
+                                if let Some(records) = load_database_records(
+                                    &database,
+                                    &snapshots,
+                                    fs,
+                                    own_path.as_ref(),
+                                )
+                                .await
+                                {
+                                    databases.insert(key.clone(), records);
+                                }
+                            }
+                            let Some(records) = databases.get(&key) else {
+                                continue;
+                            };
+                            let filtered: Vec<crate::views::ViewRecord> = records
+                                .iter()
+                                .filter(|record| {
+                                    criteria.as_deref().is_none_or(|criteria| {
+                                        crate::views::record_matches(record, criteria)
+                                    })
+                                })
+                                .map(|record| crate::views::ViewRecord {
+                                    page: record.page.clone(),
+                                    fields: record.fields.clone(),
+                                })
+                                .collect();
+                            // DSUM → SUM, DCOUNT → COUNT, ...
+                            let field = field.as_deref().filter(|field| !field.is_empty());
+                            if let Some(value) = crate::views::compute_summary(
+                                &function[1..],
+                                field,
+                                &filtered,
+                            ) {
+                                // None and an explicit "" field produce the
+                                // same key, matching the evaluator's lookup.
+                                formula_fields.insert(
+                                    crate::formulas::database_aggregate_key(
+                                        &function,
+                                        &database,
+                                        field,
+                                        criteria.as_deref(),
+                                    ),
+                                    value,
+                                );
+                            }
+                        }
+                    }
+
+                    // Cross-page FIELD("page", "field") references: resolve
+                    // against the captured snapshots and load just those pages.
+                    if let Some(fs) = fs.as_ref() {
+                        for page in referenced {
+                            let file_name = format!("{page}.md");
+                            let path = snapshots.iter().find_map(|snapshot| {
+                                // include_ignored: wiki notes are often gitignored.
+                                snapshot.files(true, 0).find_map(|entry| {
+                                    let name = entry.path.file_name()?;
+                                    name.eq_ignore_ascii_case(&file_name)
+                                        .then(|| snapshot.absolutize(&entry.path))
+                                })
+                            });
+                            if let Some(path) = path
+                                && let Ok(source) = fs.load(&path).await
+                            {
                                 for (key, value) in crate::formulas::build_field_index(&source) {
                                     formula_fields.insert(
                                         crate::formulas::cross_page_key(&page, &key),
@@ -667,7 +744,7 @@ impl MarkdownPreviewView {
                         }
                     }
                     Some((
-                        contents,
+                        SharedString::from(contents),
                         selection_start,
                         Rc::new(formula_fields),
                         Rc::new(frontmatter),
@@ -1179,6 +1256,16 @@ impl MarkdownPreviewView {
             let formula_fields = self.formula_fields.clone();
             move |expression| crate::formulas::evaluate(expression, &formula_fields)
         })
+        .table_row_filter({
+            let formula_fields = self.formula_fields.clone();
+            move |expression, cells| {
+                let mut fields = (*formula_fields).clone();
+                for (header, value) in cells {
+                    fields.insert(crate::formulas::col_key(header), value.clone());
+                }
+                crate::formulas::evaluate_condition(expression, &fields)
+            }
+        })
         // (resolver returns the icon SVG path; the markdown element renders it as
         // crisp vector geometry rather than a rasterized image.)
         .on_url_click({
@@ -1329,6 +1416,80 @@ fn open_preview_url(
 /// Resolve an Obsidian-style wikilink target (the text inside `[[ ]]`) to a
 /// markdown file with that name anywhere in the project's worktrees and open
 /// it. Returns false if no matching file is found.
+/// Expands one ```view block: finds the `from:` folder in the worktrees,
+/// loads every markdown page under it as a record (excluding the view's own
+/// page), and renders the filtered/sorted table. A missing folder renders an
+/// inline error instead of a table.
+async fn expand_view_block(
+    block: &crate::views::ViewBlock,
+    snapshots: &[worktree::Snapshot],
+    fs: &std::sync::Arc<dyn fs::Fs>,
+    own_path: Option<&ProjectPath>,
+) -> String {
+    match load_database_records(&block.from, snapshots, fs, own_path).await {
+        Some(records) => crate::views::render_view_table(block, records),
+        None => format!(
+            "**#ERROR: no folder named \"{}\" found for this view**\n",
+            block.from
+        ),
+    }
+}
+
+/// Loads a folder database's records: every markdown page under the first
+/// folder matching `from` (by name or path), excluding the querying page.
+/// `None` when no such folder exists.
+async fn load_database_records(
+    from: &str,
+    snapshots: &[worktree::Snapshot],
+    fs: &std::sync::Arc<dyn fs::Fs>,
+    own_path: Option<&ProjectPath>,
+) -> Option<Vec<crate::views::ViewRecord>> {
+    let mut folder = None;
+    'outer: for snapshot in snapshots {
+        for entry in snapshot.entries(true, 0) {
+            if entry.is_dir()
+                && (entry
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(from))
+                    || entry.path.as_unix_str().eq_ignore_ascii_case(from))
+            {
+                folder = Some((snapshot, entry.path.clone()));
+                break 'outer;
+            }
+        }
+    }
+    let (snapshot, folder_path) = folder?;
+
+    let mut records = Vec::new();
+    let entries: Vec<_> = snapshot
+        .files(true, 0)
+        .filter(|entry| entry.path.starts_with(&folder_path))
+        .map(|entry| entry.path.clone())
+        .collect();
+    for path in entries {
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".md") else {
+            continue;
+        };
+        if own_path.is_some_and(|own| {
+            own.worktree_id == snapshot.id() && own.path.as_ref() == path.as_ref()
+        }) {
+            continue;
+        }
+        let Ok(source) = fs.load(&snapshot.absolutize(&path)).await else {
+            continue;
+        };
+        records.push(crate::views::ViewRecord {
+            page: stem.to_string(),
+            fields: crate::formulas::build_field_index(&source),
+        });
+    }
+    Some(records)
+}
+
 fn open_wikilink_target(
     name: &str,
     view: &WeakEntity<MarkdownPreviewView>,
@@ -2071,37 +2232,92 @@ impl Item for MarkdownPreviewView {
 impl MarkdownPreviewView {
     /// The frontmatter properties panel (Obsidian-style): muted key–value
     /// rows under the title, shown when toggled from the toolbar.
-    fn frontmatter_panel(&self, cx: &App) -> Option<gpui::AnyElement> {
+    fn frontmatter_panel(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !show_frontmatter(cx) || self.frontmatter.is_empty() {
             return None;
         }
-        let colors = cx.theme().colors();
+        let text_muted = cx.theme().colors().text_muted;
+        let border_variant = cx.theme().colors().border_variant;
+        let rows = self
+            .frontmatter
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(key, value)| {
+                let value = self.frontmatter_value(&key, &value, cx);
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(
+                        div()
+                            .min_w(rems(9.))
+                            .text_color(text_muted)
+                            .child(SharedString::from(key)),
+                    )
+                    .child(value)
+            })
+            .collect::<Vec<_>>();
         Some(
             v_flex()
                 .mb_3()
                 .pb_2()
                 .gap_0p5()
                 .border_b_1()
-                .border_color(colors.border_variant)
+                .border_color(border_variant)
                 .text_size(px(13.))
-                .children(self.frontmatter.iter().map(|(key, value)| {
-                    h_flex()
-                        .gap_2()
-                        .items_start()
-                        .child(
-                            div()
-                                .min_w(rems(9.))
-                                .text_color(colors.text_muted)
-                                .child(SharedString::from(key.clone())),
-                        )
-                        .child(
-                            div()
-                                .text_color(colors.text)
-                                .child(SharedString::from(value.clone())),
-                        )
-                }))
+                .children(rows)
                 .into_any_element(),
         )
+    }
+
+    /// A property value: a `[[wikilink]]` renders as a clickable link with the
+    /// target page's icon (so relationships like `Father: [[Name]]` navigate);
+    /// anything else renders as plain text.
+    fn frontmatter_value(
+        &self,
+        key: &str,
+        value: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = cx.theme().colors();
+        let trimmed = value.trim();
+        let link_target = trimmed
+            .strip_prefix("[[")
+            .and_then(|inner| inner.strip_suffix("]]"));
+        let Some(inner) = link_target else {
+            return div()
+                .text_color(colors.text)
+                .child(SharedString::from(value.to_string()))
+                .into_any_element();
+        };
+        let (target, display) = match inner.split_once("\\|").or_else(|| inner.split_once('|')) {
+            Some((target, display)) => (target.trim().to_string(), display.trim().to_string()),
+            None => (inner.trim().to_string(), inner.trim().to_string()),
+        };
+        let icon = self
+            .link_icon_index
+            .get(&target.to_ascii_lowercase())
+            .and_then(|path| markdown::svg_icon::render_page_icon(path, px(14.)));
+        let workspace = self.workspace.clone();
+        let view = cx.entity().downgrade();
+        h_flex()
+            .gap_1()
+            .items_center()
+            .children(icon)
+            .child(
+                div()
+                    .id(ElementId::Name(format!("frontmatter-link-{key}").into()))
+                    .text_color(colors.text_accent)
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        if let Some(workspace) = workspace.upgrade() {
+                            open_wikilink_target(&target, &view, &workspace, window, cx);
+                        }
+                    })
+                    .child(SharedString::from(display)),
+            )
+            .into_any_element()
     }
 }
 

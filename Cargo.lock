@@ -10459,6 +10459,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "editor",
+ "fs",
  "gpui",
  "language",
  "log",
@@ -10472,6 +10473,7 @@ dependencies = [
  "urlencoding",
  "util",
  "workspace",
+ "worktree",
  "zed_actions",
 ]
 

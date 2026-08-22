@@ -14,10 +14,15 @@ path = "src/markdown_preview.rs"
 [features]
 test-support = []
 
+[[bin]]
+name = "mdview"
+path = "src/bin/mdview.rs"
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
 editor.workspace = true
+fs.workspace = true
 gpui.workspace = true
 language.workspace = true
 log.workspace = true
@@ -30,6 +35,7 @@ ui.workspace = true
 urlencoding.workspace = true
 util.workspace = true
 workspace.workspace = true
+worktree.workspace = true
 zed_actions.workspace = true
 
 [dev-dependencies]

@@ -4,6 +4,7 @@ use workspace::Workspace;
 pub mod formulas;
 pub mod markdown_preview_settings;
 pub mod markdown_preview_view;
+pub mod views;
 
 pub use zed_actions::preview::markdown::{OpenPreview, OpenPreviewToTheSide};
 
